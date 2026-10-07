@@ -27,7 +27,6 @@ Run non-Claude models (via the `pi` CLI) as native background subagents in Claud
 - Not hiding secrets from reads (`~/.ssh` etc. stay readable) — same as codex workspace-write. Documented in README.
 - skipped: `message_claude` (pi → Claude mid-task messaging) — add when a real task needs pi to ask Claude something mid-run.
 - skipped: Gemini/OpenAI preset agents — add when wanted; `pi:run` covers them meanwhile.
-- skipped: Linux sandbox (bwrap) — add when run on Linux; on non-macOS, `workspace-write` refuses to start rather than run unsandboxed.
 
 ## Done criteria
 1. `claude plugin validate` (or equivalent load) passes; with the plugin installed, `pi:grok` and `pi:run` appear as agent types next to `codex:*`, and `mcp__pi__pi_list` is callable.
@@ -61,3 +60,10 @@ Run non-Claude models (via the `pi` CLI) as native background subagents in Claud
 - macOS only for sandboxed modes. Node 18+. Claude Code with the function-hooks plugin API.
 - Live model calls in done criteria use xai credits; keep test prompts tiny.
 - Don't touch the installed codex plugin.
+
+## Addendum (2026-10-07): Linux support
+Trigger hit: user wants it on an Ubuntu 24.04 host (user@172.16.20.189; bwrap 0.9 works unprivileged, Node 22).
+- `sandboxArgv` on linux wraps with bubblewrap: `--ro-bind / /`, `--dev-bind /dev /dev`, `--proc /proc`, writable binds for PROJECT (workspace-write only), /tmp, /var/tmp, $TMPDIR if set, and pi state; network shared; `--die-with-parent`; cwd preserved.
+- pi state on Linux: bwrap can't bind a path that doesn't exist yet (pi's `*.lock` dirs), so `~/.pi/agent` is bound writable, then every existing entry in it except `sessions/`, `auth.json`, `settings.json` is re-bound read-only at launch. Gap vs macOS: the agent can create *new* files in `~/.pi/agent`. Documented in README.
+- darwin keeps sandbox-exec unchanged. Other platforms (or linux without bwrap): sandboxed modes refuse with a clear error naming the missing tool.
+- Done: unit tests for the linux argv; verify.sh's sandbox check runs on linux too; on the host, a pi:grok/pi:run run (if credentials exist there) creates ./inside.txt and is denied ~/pi-escape.txt; read-only blocks project writes (non-model check).
