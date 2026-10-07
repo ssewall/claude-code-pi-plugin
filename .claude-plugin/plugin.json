@@ -1,63 +1,53 @@
 {
-  "name": "codex",
-  "version": "0.2.3",
+  "name": "pi",
+  "version": "0.1.0",
   "author": {
-    "name": "SSS135"
+    "name": "ssewall"
   },
-  "description": "Run OpenAI Codex jobs as native background subagents (codex:luna, codex:sol, codex:astra, codex:terra): the native task list, SendMessage, TaskStop and finish notifications, with Codex approval requests as Claude Code dialogs.",
+  "description": "Run pi coding-agent jobs (any pi model, Grok by default) as native background subagents (pi:grok, pi:run): the native task list, SendMessage, TaskStop and finish notifications, confined by a macOS sandbox-exec profile.",
   "types": "./types/index.d.ts",
   "userConfig": {
-    "codexPath": {
+    "piPath": {
       "type": "string",
-      "title": "Codex binary",
-      "description": "Path to the codex CLI binary (needs `codex app-server`). When this path does not exist, `codex` is looked up on PATH.",
-      "default": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+      "title": "pi binary",
+      "description": "Path to the pi CLI binary (needs `pi --mode rpc`). When this path does not exist, `pi` is looked up on PATH.",
+      "default": "/opt/homebrew/bin/pi"
     },
     "nodePath": {
       "type": "string",
       "title": "Node binary",
-      "description": "Node 18+ used to run the bridge process. When this path does not exist, `node` is looked up on PATH.",
+      "description": "Node 18+ used to run the bridge process (and pi). When this path does not exist, `node` is looked up on PATH.",
       "default": "/opt/homebrew/bin/node"
     },
     "defaultEffort": {
       "type": "string",
       "title": "Default effort",
-      "description": "Codex reasoning effort for every model when the prompt sets no effort: header line. per-model: each model's own default, luna max and sol, astra and terra high.",
+      "description": "pi thinking level when the prompt sets no effort: header line. per-model: each agent's own default (high).",
       "default": "per-model",
       "options": [
         "per-model",
+        "off",
+        "minimal",
         "low",
         "medium",
         "high",
         "xhigh",
-        "max",
-        "ultra"
+        "max"
       ]
     },
     "defaultSandbox": {
       "type": "string",
       "title": "Default sandbox",
-      "description": "Sandbox when the prompt sets no sandbox: header line.",
+      "description": "Sandbox when the prompt sets no sandbox: header line. workspace-write: writes only in the project, /tmp and pi's session dir; read-only: no project writes and read tools only; full-access: no sandbox.",
       "default": "workspace-write",
       "options": [
         "read-only",
         "workspace-write",
         "full-access"
       ]
-    },
-    "defaultApprovals": {
-      "type": "string",
-      "title": "Default approvals",
-      "description": "auto: Codex's own reviewer decides on escalations (looser than Claude auto mode); ask: you approve each in a dialog; never: the sandbox alone decides. The full bypass, yolo, is never a user-wide default: only an explicit request or a project's .claude/codex.json sets it.",
-      "default": "auto",
-      "options": [
-        "auto",
-        "ask",
-        "never"
-      ]
     }
   },
-  "homepage": "https://github.com/SSS135/claude-code-codex-plugin",
-  "repository": "https://github.com/SSS135/claude-code-codex-plugin",
+  "homepage": "https://github.com/ssewall/claude-code-pi-plugin",
+  "repository": "https://github.com/ssewall/claude-code-pi-plugin",
   "license": "MIT"
 }

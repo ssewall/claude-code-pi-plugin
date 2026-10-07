@@ -1,6 +1,6 @@
 {
-  "name": "codex-plugin",
-  "description": "Run OpenAI Codex agents from Claude Code like background subagents.",
-  "owner": { "name": "SSS135" },
-  "plugins": [{ "name": "codex", "source": "./" }]
+  "name": "pi-plugin",
+  "description": "Run pi coding-agent jobs from Claude Code like background subagents.",
+  "owner": { "name": "ssewall" },
+  "plugins": [{ "name": "pi", "source": "./" }]
 }

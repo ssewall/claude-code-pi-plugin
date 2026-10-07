@@ -1,13 +1,13 @@
-// codex: OpenAI Codex jobs as native background subagents of this Claude session.
+// pi: jobs of the pi coding agent as native background subagents of this Claude session.
 //
-//   Agent({ subagent_type: "codex:<alias>" }) --agent.spawn--> this module starts
-//   the Codex turn with the spawn's own prompt, keyed by the new agentId; the
+//   Agent({ subagent_type: "pi:<kind>" }) --agent.spawn--> this module starts
+//   the pi turn with the spawn's own prompt, keyed by the new agentId; the
 //   subagent's loop is answered by turn.step here (no Claude model runs): it
-//   calls codex_await until the turn ends, then answers the Codex final message.
+//   calls pi_await until the turn ends, then answers the pi final message.
 //
 //   this module --$.http.fetch(socketPath)--> bin/bridge.mjs daemon
-//   --stdio JSON-RPC--> codex app-server; the relay's stdout (NDJSON events)
-//   --$.process.spawn--> onEvent
+//   --JSONL over stdio--> one `pi --mode rpc` per job (under sandbox-exec);
+//   the relay's stdout (NDJSON events) --$.process.spawn--> onEvent
 //
 // Every engine call lives in this file (the engine follows `$` only within
 // one file); hooks/model.ts holds the pure logic it calls.
@@ -15,29 +15,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepChunk, TurnStepResult } from 'claude-code'
 
-import type { CodexAgent, CodexApprovals, CodexSandbox } from '../types'
+import type { PiAgent, PiSandbox } from '../types'
 import {
   agentSpecs,
-  aliasOfType,
   afterTurn,
-  approvalAnswer,
-  approvalDigest,
-  approvalOptions,
-  approvalQuestion,
-  autoReviewDigest,
+  applyPiEvent,
   AWAIT_TOOL,
   HANDBACK_TOOL,
   configDirs,
   type Defaults,
   effectiveDefaults,
+  jobSettings,
+  jobSpec,
+  kindOfType,
   parseHeader,
   parseProjectConfig,
-  permissionsFor,
   PROJECT_CONFIG,
   type BridgeEvent,
-  byThread,
   clip,
-  CodexError,
+  PiError,
   describeAgent,
   findIn,
   firstLine,
@@ -47,35 +43,22 @@ import {
   rowArgs,
   rowResult,
   runningTail,
+  sandboxPlatformError,
   taskLabel,
   type ToolName,
-  type Item,
-  itemCompleted,
-  itemStarted,
+  type Turn,
   LineBuffer,
-  modelEffortError,
-  effortFor,
   PER_MODEL_EFFORT,
   PREFIX,
-  resolveModel,
   resultText,
-  sandboxMode,
-  approvalParams,
   sanitize,
-  messagingParams,
-  type MessagingParams,
-  messageSummary,
   type Settings,
   sorted,
   STILL_RUNNING,
-  textInput,
-  threadResumeParams,
   TOOL_SPECS,
   trim,
-  turnStartParams,
   uniqueName,
-  type Verdict,
-  verdictOf,
+  unknownModelError,
   wrapperAnswer,
 } from './model'
 
@@ -83,8 +66,8 @@ type Engine = EngineInterface
 
 // ------------------------------------------------------------ state
 
-const agentsAtom = atom({ plugin: 'codex', key: 'agents' } as const, {})
-const bridgeKeyAtom = atom({ plugin: 'codex', key: 'bridgeKey' } as const, null)
+const agentsAtom = atom({ plugin: 'pi', key: 'agents' } as const, {})
+const bridgeKeyAtom = atom({ plugin: 'pi', key: 'bridgeKey' } as const, null)
 
 const STORE_KEY = 'agents'
 /** The native transcript's row bullet and result mark. */
@@ -92,7 +75,7 @@ const DOT = '●'
 const RESULT_MARK = '  ⎿  '
 /** Under the 30 s after which $.http.fetch gives up on an answer. */
 const POLL_SLICE_MS = 25_000
-/** How long one codex_await call blocks before the wrapper's loop calls it again. */
+/** How long one pi_await call blocks before the wrapper's loop calls it again. */
 const AWAIT_MS = 3_600_000
 /** A short wait between reads of the registry; it counts against the hook's 10 s budget. */
 const SETTLE_MS = 100
@@ -100,31 +83,26 @@ const SETTLE_MS = 100
 const SETTLE_BUDGET_MS = 5_000
 
 // Module state starts over on a reload, which is right: a reload ends every
-// in-flight wait, dialog and the bridge relay along with it.
+// in-flight wait and the bridge relay along with it.
 type Socket = { promise: Promise<string>; resolve: (path: string) => void; reject: (error: Error) => void }
 let socket: Socket | null = null
 let isBridgeRunning = false
 /** The userConfig the bridge starts with; set when the module registers. */
 let bridgeSettings: Settings | null = null
-/** Threads this app-server connection is subscribed to (thread/start or thread/resume). */
-const loadedThreads = new Set<string>()
-/** Per thread, the tail of its loads, turn starts and releases, which run one at a time. */
-const threadQueues = new Map<string, Promise<unknown>>()
-/** The node binary the bridge runs on, which Codex runs bin/codex-msg on too. */
-let nodeBinary = 'node'
-/** Subagents seen at turn.step that are not codex:* agents. */
+/** The bridge's platform, from its ready line (sandboxed modes need darwin). */
+let bridgePlatform: string | undefined
+/** Subagents seen at turn.step that are not pi:* agents. */
 const foreignAgents = new Set<string>()
-let models: Map<string, string[]> | null = null
-let askChain: Promise<unknown> = Promise.resolve()
+let models: string[] | null = null
 
 // ------------------------------------------------------------ registry
 
-async function afterWrite($: Engine, agents: Record<string, CodexAgent>): Promise<void> {
+async function afterWrite($: Engine, agents: Record<string, PiAgent>): Promise<void> {
   await $.store.set(STORE_KEY, agents)
 }
 
 /** Records a new job, its name made unique among the jobs at that moment; resolves the job as written. */
-async function putAgent($: Engine, agent: CodexAgent): Promise<CodexAgent> {
+async function putAgent($: Engine, agent: PiAgent): Promise<PiAgent> {
   let written = agent
   const agents = await update($, agentsAtom, all => {
     written = sanitize({ ...agent, name: uniqueName(all, agent.name) })
@@ -135,13 +113,9 @@ async function putAgent($: Engine, agent: CodexAgent): Promise<CodexAgent> {
 }
 
 /** Applies `change` to the agent if it exists; resolves the agent as written. */
-async function patchAgent(
-  $: Engine,
-  id: string,
-  change: (agent: CodexAgent) => Partial<CodexAgent>,
-): Promise<CodexAgent | undefined> {
+async function patchAgent($: Engine, id: string, change: (agent: PiAgent) => Partial<PiAgent>): Promise<PiAgent | undefined> {
   const now = await $.clock.now()
-  let written: CodexAgent | undefined
+  let written: PiAgent | undefined
   const agents = await update($, agentsAtom, all => {
     const agent = all[id]
     if (!agent) return all
@@ -154,7 +128,7 @@ async function patchAgent(
 
 /** Fills $.state from the store after a restart; after a reload $.state is the fresher copy. */
 async function loadFromStore($: Engine): Promise<void> {
-  const stored = ((await $.store.get(STORE_KEY)) ?? {}) as Record<string, CodexAgent>
+  const stored = ((await $.store.get(STORE_KEY)) ?? {}) as Record<string, PiAgent>
   const agents = await update($, agentsAtom, live => ({ ...stored, ...live }))
   await afterWrite($, agents)
 }
@@ -181,7 +155,7 @@ async function resolveBinary($: Engine, configured: string, name: string): Promi
 async function startBridge($: Engine): Promise<void> {
   if (isBridgeRunning) return
   const settings = bridgeSettings
-  if (!settings) throw new CodexError('the codex plugin is not registered')
+  if (!settings) throw new PiError('the pi plugin is not registered')
   isBridgeRunning = true
   const current = newSocket()
   socket = current
@@ -189,24 +163,26 @@ async function startBridge($: Engine): Promise<void> {
   const fresh = crypto.randomUUID().replaceAll('-', '').slice(0, 16)
   const key = (await update($, bridgeKeyAtom, held => held ?? fresh)) as string
   const node = await resolveBinary($, settings.nodePath, 'node')
-  nodeBinary = node
-  const codex = await resolveBinary($, settings.codexPath, 'codex')
-  const argv = [node, `${$.plugin.root}/bin/bridge.mjs`, codex, key]
+  const pi = await resolveBinary($, settings.piPath, 'pi')
+  const argv = [node, `${$.plugin.root}/bin/bridge.mjs`, pi, key]
 
   const handle = async (line: string) => {
     let event: BridgeEvent
     try {
       event = JSON.parse(line) as BridgeEvent
     } catch {
-      $.ui.log(`codex bridge: unreadable line ${clip(line, 200)}`, { to: 'debug' })
+      $.ui.log(`pi bridge: unreadable line ${clip(line, 200)}`, { to: 'debug' })
       return
     }
-    if (event.type === 'ready') current.resolve(event.socket)
-    if (event.type === 'fatal') current.reject(new CodexError(`codex bridge failed: ${event.message}`))
+    if (event.type === 'ready') {
+      bridgePlatform = event.platform
+      current.resolve(event.socket)
+    }
+    if (event.type === 'fatal') current.reject(new PiError(`pi bridge failed: ${event.message}`))
     try {
       await onEvent($, event)
     } catch (error) {
-      $.ui.log(`codex: handling ${clip(line, 120)} failed: ${String(error)}`, { to: 'debug' })
+      $.ui.log(`pi: handling ${clip(line, 120)} failed: ${String(error)}`, { to: 'debug' })
     }
   }
 
@@ -215,18 +191,17 @@ async function startBridge($: Engine): Promise<void> {
     try {
       for await (const chunk of $.process.spawn({ argv })) {
         if (chunk.stream === 'stderr') {
-          $.ui.log(`codex bridge: ${chunk.text.trimEnd()}`, { to: 'debug' })
+          $.ui.log(`pi bridge: ${chunk.text.trimEnd()}`, { to: 'debug' })
           continue
         }
         for (const line of lines.push(chunk.text)) await handle(line)
       }
       for (const line of lines.rest()) await handle(line)
     } catch (error) {
-      $.ui.log(`codex bridge stopped: ${String(error)}`)
+      $.ui.log(`pi bridge stopped: ${String(error)}`)
     } finally {
       isBridgeRunning = false
-      loadedThreads.clear()
-      current.reject(new CodexError('the codex bridge stopped'))
+      current.reject(new PiError('the pi bridge stopped'))
       if (socket === current) socket = null
     }
   })()
@@ -235,154 +210,70 @@ async function startBridge($: Engine): Promise<void> {
 /** The daemon's socket, starting the bridge when none runs (the daemon exits when idle). */
 async function bridgeSocket($: Engine): Promise<string> {
   await startBridge($)
-  if (!socket) throw new CodexError('the codex bridge is not running')
+  if (!socket) throw new PiError('the pi bridge is not running')
   return socket.promise
 }
 
-async function post($: Engine, endpoint: string, body: unknown): Promise<Record<string, unknown>> {
+async function call($: Engine, method: 'GET' | 'POST', endpoint: string, body?: unknown): Promise<Record<string, unknown>> {
   const socketPath = await bridgeSocket($)
-  const response = await $.http.fetch(`http://codex${endpoint}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+  const response = await $.http.fetch(`http://pi${endpoint}`, {
+    method,
+    ...(method === 'POST' ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) } : {}),
     socketPath,
   })
   const parsed = JSON.parse(response.text) as Record<string, unknown>
   const error = parsed.error as { message?: string } | undefined
-  if (error) throw new CodexError(error.message ?? JSON.stringify(error))
+  if (error) throw new PiError(error.message ?? JSON.stringify(error))
   return parsed
 }
 
-/** One JSON-RPC call to codex app-server; resolves its `result`. */
-async function rpc<T>($: Engine, method: string, params: unknown): Promise<T> {
-  // The bridge answers with a timeout error before $.http.fetch's own 30 s cap.
-  return (await post($, '/rpc', { method, params, timeoutMs: POLL_SLICE_MS })).result as T
-}
+const post = ($: Engine, endpoint: string, body: unknown) => call($, 'POST', endpoint, body)
 
-type WaitAnswer =
-  | { status: 'completed' | 'idle'; turn: { id?: string; status?: string; items?: Item[] } | null }
-  | { status: 'message'; messages: string[] }
-  | { status: 'timeout' }
+type WaitAnswer = { status: 'completed' | 'idle'; turn: Turn | null } | { status: 'timeout' }
 
-/** Long-polls until the thread's turn ends or the job (named by `msgKey`) sends a codex-msg message: time inside $.http.fetch is budget-free. */
-async function waitTurn($: Engine, threadId: string, timeoutMs: number, msgKey: string): Promise<WaitAnswer> {
+/** Long-polls until the job's turn ends: time inside $.http.fetch is budget-free. */
+async function waitTurn($: Engine, jobId: string, timeoutMs: number): Promise<WaitAnswer> {
   // $.http.fetch gives up after 30 s and takes no timeout option: poll in slices under that.
   const deadline = (await $.clock.now()) + timeoutMs
   for (;;) {
     const left = deadline - (await $.clock.now())
     const slice = Math.max(1, Math.min(left, POLL_SLICE_MS))
-    const answer = (await post($, '/wait', { threadId, msgKey, timeoutMs: slice })) as unknown as WaitAnswer
+    const answer = (await post($, '/wait', { jobId, timeoutMs: slice })) as unknown as WaitAnswer
     if (answer.status !== 'timeout' || left <= POLL_SLICE_MS) return answer
   }
 }
 
-/** The thread params that let a job message this session through the bridge's socket (see messagingParams). */
-async function messagingFor($: Engine, msgKey: string): Promise<MessagingParams> {
-  const socketPath = await bridgeSocket($)
-  return messagingParams(nodeBinary, $.plugin.root, socketPath, msgKey)
-}
-
-/** Runs `work` once the thread's earlier loads, turn starts and releases have finished. */
-function onThread<T>(threadId: string, work: () => Promise<T>): Promise<T> {
-  const run = (threadQueues.get(threadId) ?? Promise.resolve()).then(work)
-  const tail = run.catch(() => undefined)
-  threadQueues.set(threadId, tail)
-  void tail.then(() => {
-    if (threadQueues.get(threadId) === tail) threadQueues.delete(threadId)
-  })
-  return run
-}
-
-/**
- * Unsubscribes from a thread whose turn ended and that runs no newer one, so
- * app-server unloads it once idle (about a minute later) and stops its MCP
- * servers: bin/codex-msg and the MCP servers of Codex's own plugins. The next
- * turn on it resumes it first (ensureLoaded).
- */
-function releaseThread($: Engine, threadId: string): Promise<void> {
-  return onThread(threadId, async () => {
-    const agent = byThread(await read($, agentsAtom), threadId)
-    if (!loadedThreads.has(threadId) || (agent && isLive(agent))) return
-    loadedThreads.delete(threadId)
-    await rpc($, 'thread/unsubscribe', { threadId }).catch(error =>
-      $.ui.log(`codex: releasing thread ${threadId} failed: ${errorText(error)}`, { to: 'debug' }),
-    )
-  })
-}
-
 // ------------------------------------------------------------ operations
 
-async function listModels($: Engine): Promise<Map<string, string[]>> {
+async function listModels($: Engine): Promise<string[]> {
   if (models) return models
-  const found = new Map<string, string[]>()
-  let cursor: string | null = null
-  do {
-    const page: { data: { id: string; supportedReasoningEfforts: { reasoningEffort: string }[] }[]; nextCursor: string | null } =
-      await rpc($, 'model/list', { includeHidden: true, cursor })
-    for (const model of page.data) found.set(model.id, model.supportedReasoningEfforts.map(one => one.reasoningEffort))
-    cursor = page.nextCursor
-  } while (cursor)
-  models = found
-  return found
-}
-
-/** Loads the agent's thread into this app-server (after a Claude restart). */
-async function ensureLoaded($: Engine, agent: CodexAgent): Promise<void> {
-  if (loadedThreads.has(agent.threadId)) return
-  try {
-    await rpc($, 'thread/resume', threadResumeParams(agent, agent.msgKey ? await messagingFor($, agent.msgKey) : undefined))
-  } catch (error) {
-    if (error instanceof CodexError && error.message.includes('active writer')) {
-      throw new CodexError(
-        `${agent.name}'s thread is still held by another Codex process: a previous bridge's (it exits about 20 s after its Claude session ends or the plugin reloads onto another version) or another live session's. Try again shortly.`,
-      )
-    }
-    throw error
-  }
-  loadedThreads.add(agent.threadId)
+  const answer = await call($, 'GET', '/models')
+  models = ((answer.result as { models?: string[] } | undefined)?.models ?? []).map(String)
+  return models
 }
 
 type JobInput = {
   description: string
   name: string
+  kind: string
   model: string
   effort: string
-  sandbox: CodexSandbox
-  approvals: CodexApprovals
+  sandbox: PiSandbox
   cwd: string
-  msgKey: string
 }
 
-/** Starts and names the Codex thread; the turn starts once the subagent's id is known. */
-async function startThread($: Engine, input: JobInput): Promise<{ threadId: string; model: string }> {
-  const started = await rpc<{ thread: { id: string }; model: string }>($, 'thread/start', {
-    model: input.model,
-    cwd: input.cwd,
-    sandbox: sandboxMode(input.sandbox),
-    ...approvalParams(input.approvals),
-    ephemeral: false,
-    ...(await messagingFor($, input.msgKey)),
-  })
-  loadedThreads.add(started.thread.id)
-  // Names the session in the Codex app, `codex resume` and `codex agents`; the agent runs either way.
-  await rpc($, 'thread/name/set', { threadId: started.thread.id, name: input.name }).catch(error =>
-    $.ui.log(`codex: naming thread ${started.thread.id} failed: ${String(error)}`, { to: 'debug' }),
-  )
-  return { threadId: started.thread.id, model: started.model }
-}
-
-async function newAgent($: Engine, id: string, threadId: string, input: JobInput): Promise<CodexAgent> {
+async function newAgent($: Engine, id: string, input: JobInput): Promise<PiAgent> {
   const now = await $.clock.now()
   return {
     id,
     name: input.name,
     description: input.description,
-    threadId,
+    kind: input.kind,
     model: input.model,
     effort: input.effort,
     sandbox: input.sandbox,
-    approvals: input.approvals,
     cwd: input.cwd,
+    sessionFile: null,
     status: 'starting',
     currentTurnId: null,
     lastTurnId: null,
@@ -391,8 +282,6 @@ async function newAgent($: Engine, id: string, threadId: string, input: JobInput
     activity: 'starting',
     tokens: 0,
     error: null,
-    msgKey: input.msgKey,
-    outbox: [],
     digest: [],
     startedAt: now,
     updatedAt: now,
@@ -402,50 +291,38 @@ async function newAgent($: Engine, id: string, threadId: string, input: JobInput
   }
 }
 
-/** Starts a new turn, passing sandbox, approvals, model and effort again. */
-function startTurn($: Engine, agent: CodexAgent, text: string): Promise<CodexAgent> {
-  return onThread(agent.threadId, async () => {
-    await ensureLoaded($, agent)
-    const now = await $.clock.now()
-    const started = await rpc<{ turn: { id: string } }>($, 'turn/start', turnStartParams(agent, text))
-    const written = await patchAgent($, agent.id, current => ({
-      status: 'running',
-      // turn/started may already have landed with the same id
-      currentTurnId: started.turn.id,
-      error: null,
-      activity: current.currentTurnId === started.turn.id ? current.activity : 'thinking',
-      turnStartedAt: now,
-    }))
-    return written ?? agent
-  })
-}
+type SendResult = { action: 'steered' | 'started'; turnId: string; sessionFile: string | null }
 
-/** Steers the running turn, or starts a new one when none runs. */
-async function sendMessage($: Engine, agent: CodexAgent, text: string): Promise<'steered' | 'started'> {
-  if (agent.status === 'running' && agent.currentTurnId) {
-    try {
-      await ensureLoaded($, agent)
-      await rpc($, 'turn/steer', { threadId: agent.threadId, expectedTurnId: agent.currentTurnId, input: textInput(text) })
-      return 'steered'
-    } catch (error) {
-      // The turn ended between our read and the steer: start a new one below.
-      if (!(error instanceof CodexError)) throw error
-    }
-  }
-  await startTurn($, agent, text)
-  return 'started'
+/** Steers the running turn, or starts a new one when none runs (the bridge relaunches pi on its session when needed). */
+async function sendMessage($: Engine, agent: PiAgent, text: string): Promise<'steered' | 'started'> {
+  const now = await $.clock.now()
+  const answer = (await post($, '/send', { job: jobSpec(agent), text })).result as SendResult
+  await patchAgent($, agent.id, current => ({
+    sessionFile: answer.sessionFile ?? current.sessionFile,
+    ...(answer.action === 'started'
+      ? {
+          status: 'running' as const,
+          currentTurnId: answer.turnId,
+          error: null,
+          digest: [],
+          activity: 'thinking',
+          turnStartedAt: now,
+        }
+      : {}),
+  }))
+  return answer.action
 }
 
 // ------------------------------------------------------------ native agents
 
-/** Whether a subagent no record names yet is a codex:* agent (its spawn hook is still starting the turn). */
-async function isCodexType($: Engine, agentId: string): Promise<boolean> {
+/** Whether a subagent no record names yet is a pi:* agent (its spawn hook is still starting the turn). */
+async function isPiType($: Engine, agentId: string): Promise<boolean> {
   const info = (await $.agent.list()).find(agent => agent.id === agentId)
-  return info !== undefined && aliasOfType(info.type) !== undefined
+  return info !== undefined && kindOfType(info.type) !== undefined
 }
 
-/** The Codex job a SendMessage recipient names: an agentId, or the name the Agent call gave. */
-async function recipient($: Engine, to: string): Promise<CodexAgent | undefined> {
+/** The pi job a SendMessage recipient names: an agentId, or the name the Agent call gave. */
+async function recipient($: Engine, to: string): Promise<PiAgent | undefined> {
   const agents = await read($, agentsAtom)
   if (agents[to]) return agents[to]
   const info = (await $.agent.list()).find(agent => agent.name === to)
@@ -453,29 +330,21 @@ async function recipient($: Engine, to: string): Promise<CodexAgent | undefined>
 }
 
 /** Records how the turn the bridge reported ended, if the registry has not yet. */
-async function settleTurn($: Engine, agent: CodexAgent, answer: WaitAnswer): Promise<void> {
-  if (answer.status === 'timeout' || answer.status === 'message') return
+async function settleTurn($: Engine, agent: PiAgent, answer: WaitAnswer): Promise<void> {
+  if (answer.status === 'timeout') return
   const now = await $.clock.now()
   const turn = answer.turn
   await patchAgent($, agent.id, current => {
     if (!isLive(current)) return {}
     if (turn && (current.currentTurnId === null || turn.id === current.currentTurnId)) return afterTurn(current, turn, now)
-    // The bridge runs no turn on the thread and its last one is not ours.
-    return { status: 'failed', currentTurnId: null, lastTurnStatus: 'failed', error: 'the Codex turn was lost', turnEndedAt: now }
+    // The bridge runs no turn for the job and its last one is not ours.
+    return { status: 'failed', currentTurnId: null, lastTurnStatus: 'failed', error: 'the pi turn was lost', turnEndedAt: now }
   })
 }
 
-/**
- * SendMessage calls this module made for a wrapper. Its tool.check hook allows
- * them: no model request made the step, so auto mode's classifier, which
- * judges a model's actions with its request, has no verdict to give.
- */
-const relayCalls = new Set<string>()
-
 /** A wrapper step that is one tool call the plugin makes. */
 async function* toolStep(e: { turnId: string; index: number }, name: string, input: Record<string, unknown>): AsyncGenerator<TurnStepChunk, TurnStepResult> {
-  const id = `toolu_codex_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`
-  if (name === 'SendMessage') relayCalls.add(id)
+  const id = `toolu_pi_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`
   yield { kind: 'tool', index: 0, id, name }
   yield { kind: 'input', index: 0, json: JSON.stringify(input) }
   yield { kind: 'stop', stopReason: 'tool_use', usage: null }
@@ -485,51 +354,29 @@ async function* toolStep(e: { turnId: string; index: number }, name: string, inp
 /** Whether the wrapper's last step was a SubagentHandback call that failed: the engine does not offer that tool here. */
 async function isHandbackRefused($: Engine, agentId: string): Promise<boolean> {
   const messages = await $.session.messages({ agentId })
-  if (!Array.isArray(messages)) throw new CodexError(`reading the agent's messages failed: ${messages.deny}`)
+  if (!Array.isArray(messages)) throw new PiError(`reading the agent's messages failed: ${messages.deny}`)
   const last = messages.filter(message => message.role === 'assistant').at(-1)
   return last?.toolUses.some(use => use.tool === HANDBACK_TOOL && use.isError === true) ?? false
 }
 
-/** Holds codex-msg messages until the wrapper's loop passes them on with SendMessage. */
-async function queueMessages($: Engine, agentId: string, messages: readonly string[]): Promise<void> {
-  if (messages.length === 0) return
-  await patchAgent($, agentId, current => ({
-    outbox: [...current.outbox, ...messages],
-    digest: [...current.digest, ...messages.map(text => `message to Claude: ${clip(firstLine(text), 200)}`)],
-  }))
-}
-
-const messagesText = (count: number) => `Codex sent ${count === 1 ? 'a message' : `${count} messages`} for the main session.`
-
 /**
- * codex_await: blocks until the wrapper's Codex turn ends, or the job sends a
- * codex-msg message, and answers which; after AWAIT_MS it answers that the job
- * still runs. The wrapper's loop (turn.step) then passes a message on, or calls
- * it again, or ends with the result.
+ * pi_await: blocks until the wrapper's pi turn ends and answers the result;
+ * after AWAIT_MS it answers that the job still runs. The wrapper's loop
+ * (turn.step) then calls it again, or ends with the result.
  */
 async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSignal): Promise<string> {
-  if (agentId === undefined) throw new CodexError('codex_await serves codex:* agents only')
+  if (agentId === undefined) throw new PiError('pi_await serves pi:* agents only')
   const startedAt = await $.clock.now()
   const deadline = startedAt + AWAIT_MS
   let settling = 0
   for (;;) {
     const agent = (await read($, agentsAtom))[agentId]
-    if (agent && !isLive(agent)) {
-      // A message sent just before the turn ended still goes out, ahead of the result;
-      // with the bridge gone there is none to read, and the result goes alone.
-      try {
-        const last = (await post($, '/wait', { threadId: agent.threadId, msgKey: agent.msgKey, timeoutMs: 1 })) as unknown as WaitAnswer
-        if (last.status === 'message') await queueMessages($, agentId, last.messages)
-      } catch (error) {
-        $.ui.log(`codex: reading ${agent.name}'s last messages failed: ${errorText(error)}`, { to: 'debug' })
-      }
-      return wrapperAnswer(agent)
-    }
+    if (agent && !isLive(agent)) return wrapperAnswer(agent)
     if (!agent || agent.status === 'starting') {
-      // The spawn hook is between the subagent's start and the Codex turn's.
+      // The spawn hook is between the subagent's start and the pi turn's.
       if (settling >= SETTLE_BUDGET_MS) {
         if (agent) return `${STILL_RUNNING}: its turn is still starting.`
-        throw new CodexError('codex_await serves codex:* agents only, and no Codex job runs under this agent')
+        throw new PiError('pi_await serves pi:* agents only, and no pi job runs under this agent')
       }
       await $.clock.sleep(SETTLE_MS)
       settling += SETTLE_MS
@@ -539,17 +386,13 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
     if (left <= 0) return `${STILL_RUNNING}: ${describeAgent(agent, await $.clock.now())}`
     let answer: WaitAnswer
     try {
-      answer = await waitTurn($, agent.threadId, Math.min(left, POLL_SLICE_MS), agent.msgKey)
+      answer = await waitTurn($, agent.id, Math.min(left, POLL_SLICE_MS))
     } catch (error) {
       if (signal.aborted) throw error
       // The bridge is gone: the job cannot finish, so it ends here with the reason.
       const now = await $.clock.now()
-      await patchAgent($, agentId, () => ({ status: 'failed', currentTurnId: null, error: String(error instanceof Error ? error.message : error), turnEndedAt: now }))
+      await patchAgent($, agentId, () => ({ status: 'failed', currentTurnId: null, error: errorText(error), turnEndedAt: now }))
       continue
-    }
-    if (answer.status === 'message') {
-      await queueMessages($, agentId, answer.messages)
-      return messagesText(answer.messages.length)
     }
     await settleTurn($, agent, answer)
   }
@@ -557,99 +400,12 @@ async function awaitJob($: Engine, agentId: string | undefined, signal: AbortSig
 
 // ------------------------------------------------------------ events
 
-async function onNotification($: Engine, method: string, params: Record<string, unknown>): Promise<void> {
-  if (typeof params.threadId !== 'string') return
-  const agent = byThread(await read($, agentsAtom), params.threadId)
-  if (!agent) return
-  const turn = params.turn as Record<string, unknown> | undefined
-  switch (method) {
-    case 'turn/started': {
-      const now = await $.clock.now()
-      await patchAgent($, agent.id, current => ({
-        status: 'running',
-        currentTurnId: String(turn?.id),
-        digest: [],
-        turnStartedAt: current.currentTurnId === turn?.id ? current.turnStartedAt : now,
-      }))
-      return
-    }
-    case 'item/started': {
-      const change = itemStarted(params.item as Item)
-      if (change) await patchAgent($, agent.id, () => change)
-      return
-    }
-    case 'item/completed':
-      await patchAgent($, agent.id, current => itemCompleted(current, params.item as Item))
-      return
-    case 'item/autoApprovalReview/completed': {
-      const line = autoReviewDigest(params)
-      await patchAgent($, agent.id, current => ({ digest: [...current.digest, line] }))
-      return
-    }
-    case 'thread/tokenUsage/updated': {
-      const usage = params.tokenUsage as { total?: { totalTokens?: number } } | undefined
-      await patchAgent($, agent.id, current => ({ tokens: usage?.total?.totalTokens ?? current.tokens }))
-      return
-    }
-    case 'error': {
-      const error = params.error as { message?: string } | undefined
-      if (params.willRetry !== true) await patchAgent($, agent.id, () => ({ error: error?.message ?? 'error' }))
-      return
-    }
-    case 'turn/completed': {
-      if (!turn) return
-      const now = await $.clock.now()
-      // A late end of an earlier turn leaves a newer running one alone.
-      await patchAgent($, agent.id, current =>
-        current.currentTurnId === null || current.currentTurnId === turn.id ? afterTurn(current, turn, now) : {},
-      )
-      // Never hold the event loop on the release.
-      void releaseThread($, params.threadId)
-      return
-    }
-  }
-}
-
-/** Asks the person, one dialog at a time; a dismissed dialog (or -p) is a deny. */
-function askPerson($: Engine, question: string, options: string[]): Promise<Verdict> {
-  const asked = askChain.then(async (): Promise<Verdict> => {
-    try {
-      return verdictOf(await $.ui.ask(question, { options, header: 'Codex' }))
-    } catch {
-      return { kind: 'deny' }
-    }
-  })
-  askChain = asked
-  return asked
-}
-
-async function onRequest($: Engine, id: number | string, method: string, params: Record<string, unknown>): Promise<void> {
-  const agent = typeof params.threadId === 'string' ? byThread(await read($, agentsAtom), params.threadId) : undefined
-  const question = approvalQuestion(method, params, agent ? `Codex ${agent.name} (${agent.model})` : 'A Codex agent')
-  let verdict: Verdict | null = null
-  if (question !== null) {
-    const reason = typeof params.reason === 'string' && params.reason ? `\nReason: ${params.reason}` : ''
-    verdict = await askPerson($, `${question}${reason}\nAllow it?`, approvalOptions(method, params))
-  }
-  await post($, '/reply', { id, ...approvalAnswer(method, params, verdict) })
-  if (agent) {
-    const line = approvalDigest(method, params, verdict)
-    await patchAgent($, agent.id, current => ({ digest: [...current.digest, line] }))
-  }
-  // Text typed under "Other": decline, and tell the agent what the person said.
-  if (verdict?.kind === 'other' && agent) {
-    const fresh = findIn(await read($, agentsAtom), agent.id)
-    if (fresh) await sendMessage($, fresh, `The user declined that request and said: ${verdict.text}`)
-  }
-}
-
 /** After the bridge (re)starts: settle agents whose turn did not survive. */
 async function onReady($: Engine, reattached: boolean, active: Record<string, string>): Promise<void> {
   for (const agent of Object.values(await read($, agentsAtom))) {
     if (!isLive(agent)) continue
-    const turnId = active[agent.threadId]
+    const turnId = active[agent.id]
     if (turnId) {
-      loadedThreads.add(agent.threadId)
       await patchAgent($, agent.id, () => ({ status: 'running', currentTurnId: turnId }))
     } else if (!reattached) {
       // A reattached daemon replays the turn's end from its buffer; a new one never saw it.
@@ -657,7 +413,7 @@ async function onReady($: Engine, reattached: boolean, active: Record<string, st
         status: 'interrupted',
         currentTurnId: null,
         lastTurnStatus: 'interrupted',
-        error: 'the turn was lost when the Codex process restarted; a SendMessage to its agent starts a new turn on the thread',
+        error: 'the turn was lost when the pi bridge restarted; a SendMessage to its agent resumes the pi session with a new turn',
       }))
     }
   }
@@ -668,32 +424,33 @@ async function onEvent($: Engine, event: BridgeEvent): Promise<void> {
     case 'ready':
       await onReady($, event.reattached, event.active)
       return
-    case 'notification':
-      await onNotification($, event.method, event.params)
-      return
-    case 'request':
-      // Never hold the event loop on a dialog.
-      void onRequest($, event.id, event.method, event.params).catch(error =>
-        $.ui.log(`codex: answering ${event.method} failed: ${String(error)}`),
+    case 'event': {
+      // A late event of an earlier turn leaves a newer one alone.
+      await patchAgent($, event.jobId, current =>
+        event.turnId === null || current.currentTurnId === null || current.currentTurnId === event.turnId ? applyPiEvent(current, event.event) : {},
       )
       return
+    }
+    case 'turn_end': {
+      const now = await $.clock.now()
+      // A late end of an earlier turn leaves a newer running one alone.
+      await patchAgent($, event.jobId, current =>
+        current.currentTurnId === null || current.currentTurnId === event.turn.id ? afterTurn(current, event.turn, now) : {},
+      )
+      return
+    }
     case 'exit':
-      $.ui.log(`codex app-server exited (${event.code ?? event.signal}). ${event.stderrTail.slice(-3).join(' | ')}`)
-      for (const agent of Object.values(await read($, agentsAtom))) {
-        if (isLive(agent)) {
-          await patchAgent($, agent.id, () => ({ status: 'failed', currentTurnId: null, error: 'codex app-server exited' }))
-        }
-      }
+      $.ui.log(`pi for job ${event.jobId} exited (${event.code ?? event.signal}). ${event.stderrTail.slice(-3).join(' | ')}`, { to: 'debug' })
       return
     case 'fatal':
-      $.ui.log(`codex bridge failed: ${event.message}\n${event.logTail}`)
+      $.ui.log(`pi bridge failed: ${event.message}\n${event.logTail}`)
       return
   }
 }
 
 // ------------------------------------------------------------ the module
 
-/** The nearest .claude/codex.json from the session's cwd up to the project root. */
+/** The nearest .claude/pi.json from the session's cwd up to the project root. */
 async function projectConfig($: Engine): Promise<Partial<Defaults>> {
   for (const dir of configDirs(await $.session.cwd(), await $.session.root())) {
     const path = `${dir === '/' ? '' : dir}/${PROJECT_CONFIG}`
@@ -704,16 +461,16 @@ async function projectConfig($: Engine): Promise<Partial<Defaults>> {
 
 const textArg = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
-const TOOL_NAMES: readonly ToolName[] = ['codex_list', 'codex_result', 'codex_await']
+const TOOL_NAMES: readonly ToolName[] = ['pi_list', 'pi_result', 'pi_await']
 
-/** Serves codex_list (this session's jobs) and codex_result (any job); a CodexError becomes the call's error text. */
-async function runTool($: Engine, name: 'codex_list' | 'codex_result', e: unknown): Promise<string> {
+/** Serves pi_list (this session's jobs) and pi_result (any job); a PiError becomes the call's error text. */
+async function runTool($: Engine, name: 'pi_list' | 'pi_result', e: unknown): Promise<string> {
   const args = e as Record<string, unknown>
-  if (name === 'codex_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now())
+  if (name === 'pi_list') return listText(sorted(await read($, agentsAtom)), await $.session.id(), await $.clock.now())
   const ref = textArg(args.id)
-  if (!ref) throw new CodexError('id is required')
+  if (!ref) throw new PiError('id is required')
   const agent = findIn(await read($, agentsAtom), ref)
-  if (!agent) throw new CodexError(`No Codex agent "${ref}". codex_list shows them.`)
+  if (!agent) throw new PiError(`No pi agent "${ref}". pi_list shows them.`)
   return resultText(agent, args.full === true, await $.clock.now())
 }
 
@@ -721,11 +478,10 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
 
 export const register: Register = (on, options) => {
   const settings: Settings = {
-    codexPath: String(options.codexPath),
+    piPath: String(options.piPath),
     nodePath: String(options.nodePath),
     defaultEffort: options.defaultEffort === PER_MODEL_EFFORT ? undefined : String(options.defaultEffort),
-    defaultSandbox: String(options.defaultSandbox) as CodexSandbox,
-    defaultApprovals: String(options.defaultApprovals) as CodexApprovals,
+    defaultSandbox: String(options.defaultSandbox) as PiSandbox,
   }
   bridgeSettings = settings
 
@@ -735,7 +491,7 @@ export const register: Register = (on, options) => {
     try {
       project = await projectConfig($)
     } catch (error) {
-      $.ui.log(`codex: ${errorText(error)}`)
+      $.ui.log(`pi: ${errorText(error)}`)
     }
     for (const tool of TOOL_SPECS) await $.tool.register(tool)
     for (const spec of agentSpecs(effectiveDefaults(settings, project))) await $.agent.register(spec)
@@ -746,74 +502,56 @@ export const register: Register = (on, options) => {
 
   // ---------------------------------------------------------- native agents
 
-  // A codex:* spawn: the Codex thread starts before the subagent, so a bad model,
-  // effort or header refuses the Agent call itself; its turn starts with the
-  // prompt as given, header lines stripped, once the subagent's id is known.
+  // A pi:* spawn: the header, model and sandbox are checked before the subagent
+  // starts, so a bad one refuses the Agent call itself; the pi turn starts with
+  // the prompt as given, header lines stripped, once the subagent's id is known.
   on('agent.spawn', async ($, e, next) => {
-    const alias = aliasOfType(e.subagentType)
-    if (alias === undefined) return next(e)
+    const kind = kindOfType(e.subagentType)
+    if (kind === undefined) return next(e)
     let input: JobInput
     let body: string
-    let threadId: string
     try {
       const header = parseHeader(e.prompt)
       body = header.body
-      if (body.trim() === '') return { deny: 'codex: the prompt is empty once its header lines are taken off' }
-      const defaults = effectiveDefaults(settings, await projectConfig($))
-      const model = resolveModel(alias)
-      const effort = header.effort ?? effortFor(defaults, alias)
-      const { sandbox, approvals } = permissionsFor(header, defaults)
-      const error = modelEffortError(await listModels($), model, effort)
-      if (error) return { deny: `codex: ${error}` }
+      if (body.trim() === '') return { deny: 'pi: the prompt is empty once its header lines are taken off' }
+      const job = jobSettings(kind, header, effectiveDefaults(settings, await projectConfig($)))
+      const unknown = unknownModelError(await listModels($), job.model)
+      if (unknown) return { deny: `pi: ${unknown}` }
+      await bridgeSocket($)
+      const platform = sandboxPlatformError(bridgePlatform, job.sandbox)
+      if (platform) return { deny: `pi: ${platform}` }
       input = {
         description: taskLabel(e),
         // Made unique as the job is recorded (putAgent), so two spawns at once never share one.
-        name: taskLabel(e) || alias,
-        model,
-        effort,
-        sandbox,
-        approvals,
+        name: taskLabel(e) || kind,
+        kind,
+        ...job,
         cwd: e.cwd ?? (await $.session.cwd()),
-        msgKey: crypto.randomUUID().replaceAll('-', ''),
       }
-      const thread = await startThread($, input)
-      threadId = thread.threadId
-      input = { ...input, model: thread.model }
     } catch (error) {
-      return { deny: `codex: ${errorText(error)}` }
+      return { deny: `pi: ${errorText(error)}` }
     }
     const spawned = await next({ ...e, background: true })
-    if (spawned.agentId === undefined) {
-      void releaseThread($, threadId)
-      return spawned
-    }
-    const agent = await putAgent($, await newAgent($, spawned.agentId, threadId, input))
+    if (spawned.agentId === undefined) return spawned
+    const agent = await putAgent($, await newAgent($, spawned.agentId, input))
     try {
-      await startTurn($, agent, body)
+      await sendMessage($, agent, body)
     } catch (error) {
       // The subagent runs: it ends at once with this reason as its answer.
-      await patchAgent($, agent.id, () => ({ status: 'failed', error: `the Codex turn did not start: ${errorText(error)}` }))
-      void releaseThread($, threadId)
+      await patchAgent($, agent.id, () => ({ status: 'failed', error: `the pi turn did not start: ${errorText(error)}` }))
     }
     return spawned
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: the Codex job did not start (the hook failed or ran out of time)' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'pi: the pi job did not start (the hook failed or ran out of time)' }))
 
-  // The codex:* subagent's loop: every model request is answered here and no
-  // Claude model runs. While the Codex turn runs, the answer is a codex_await
-  // call; a codex-msg message is passed on as a SendMessage to main; once the
-  // turn ended, the answer is the Codex final message, verbatim.
+  // The pi:* subagent's loop: every model request is answered here and no
+  // Claude model runs. While the pi turn runs, the answer is a pi_await call;
+  // once the turn ended, the answer is the pi final message, verbatim.
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined || foreignAgents.has(e.agentId)) return yield* next(e)
     const agent = (await read($, agentsAtom))[e.agentId]
-    if (!agent && !(await isCodexType($, e.agentId))) {
+    if (!agent && !(await isPiType($, e.agentId))) {
       foreignAgents.add(e.agentId)
       return yield* next(e)
-    }
-    const message = agent?.outbox[0]
-    if (agent && message !== undefined) {
-      // A codex-msg message goes to the main session as this agent's own SendMessage, verbatim.
-      await patchAgent($, agent.id, current => ({ outbox: current.outbox.slice(1) }))
-      return yield* toolStep(e, 'SendMessage', { to: 'main', summary: messageSummary(message), message })
     }
     if (agent && !isLive(agent)) {
       const text = wrapperAnswer(agent)
@@ -827,36 +565,36 @@ export const register: Register = (on, options) => {
     return yield* toolStep(e, AWAIT_TOOL, {})
   })
 
-  // SendMessage to a codex:* agent goes to Codex first: a steer while its turn
-  // runs, a new turn on the thread once it ended (the delivery then resumes the
-  // subagent, whose loop waits for that turn). Refused when Codex refuses it.
+  // SendMessage to a pi:* agent goes to pi first: a steer while its turn runs,
+  // a new turn in the same pi session once it ended (the delivery then resumes
+  // the subagent, whose loop waits for that turn). Refused when pi refuses it.
   on('session.send', async ($, e, next) => {
     const agent = await recipient($, e.to)
     if (!agent) return next(e)
     try {
       await sendMessage($, agent, e.text)
     } catch (error) {
-      return { isDelivered: false as const, reason: `Codex did not take the message: ${errorText(error)}` }
+      return { isDelivered: false as const, reason: `pi did not take the message: ${errorText(error)}` }
     }
     return next(e)
-  }).catch(($, e, next) => (next.called ? next(e) : { isDelivered: false as const, reason: 'codex: the message did not reach Codex' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { isDelivered: false as const, reason: 'pi: the message did not reach pi' }))
 
-  // The wrapper's SendMessage relays of Codex messages: the plugin made the call, so it allows it.
-  // (SubagentHandback is left to the engine: only auto mode's classifier may allow it.)
-  on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
-    if (e.tool_use_id === undefined || !relayCalls.delete(e.tool_use_id)) return next(e)
-    return { decision: 'allow' as const, reason: "codex: relays a Codex job's message to the main session, verbatim" }
-  })
-
-  // TaskStop, or the task list's stop, kills the subagent mid codex_await: its
-  // turn ends aborted, and the Codex turn under it is interrupted.
+  // TaskStop, or the task list's stop, kills the subagent mid pi_await: its
+  // turn ends aborted, and the pi turn under it is aborted.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId === undefined || e.reason !== 'aborted') return done
     const agent = (await read($, agentsAtom))[e.agentId]
-    if (agent?.status === 'running' && agent.currentTurnId) {
-      await rpc($, 'turn/interrupt', { threadId: agent.threadId, turnId: agent.currentTurnId }).catch(error =>
-        $.ui.log(`codex: interrupting ${agent.name} failed: ${errorText(error)}`),
+    if (agent && isLive(agent)) {
+      try {
+        await post($, '/abort', { jobId: agent.id })
+      } catch (error) {
+        $.ui.log(`pi: aborting ${agent.name} failed: ${errorText(error)}`)
+      }
+      // The bridge's turn_end says so too; recorded here so pi_list shows it at once.
+      const now = await $.clock.now()
+      await patchAgent($, agent.id, current =>
+        isLive(current) ? { status: 'interrupted', currentTurnId: null, lastTurnStatus: 'interrupted', activity: 'interrupted', turnEndedAt: now } : {},
       )
     }
     return done
@@ -871,19 +609,19 @@ export const register: Register = (on, options) => {
     } catch (error) {
       return { deny: errorText(error) }
     }
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'codex: codex_await did not finish (its hook failed or ran out of time)' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'pi: pi_await did not finish (its hook failed or ran out of time)' }))
 
   // One hook for both: a matcher over a union of names does not type-check.
-  const toolPattern = new RegExp(`^${PREFIX}(codex_list|codex_result)$`)
+  const toolPattern = new RegExp(`^${PREFIX}(pi_list|pi_result)$`)
   on('tool.call', { tool: toolPattern }, async ($, e) => {
     try {
-      return { result: await runTool($, e.tool.slice(PREFIX.length) as 'codex_list' | 'codex_result', e) }
+      return { result: await runTool($, e.tool.slice(PREFIX.length) as 'pi_list' | 'pi_result', e) }
     } catch (error) {
       return { deny: errorText(error) }
     }
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: `codex: ${e.tool.slice(PREFIX.length)} did not finish (its hook failed or ran out of time)` }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: `pi: ${e.tool.slice(PREFIX.length)} did not finish (its hook failed or ran out of time)` }))
 
-  // List codex_list and codex_result up front rather than behind ToolSearch; codex_await stays behind it.
+  // List pi_list and pi_result up front rather than behind ToolSearch; pi_await stays behind it.
   on('tool.describe', async ($, e, next) => {
     const described = await next(e)
     return e.tool.startsWith(PREFIX) && e.tool !== AWAIT_TOOL ? { ...described, isDeferred: false } : described
@@ -891,7 +629,7 @@ export const register: Register = (on, options) => {
 
   // ---------------------------------------------------------- drawing
 
-  // Every codex_* call draws like a native Agent row: one header line and one result line, each
+  // Every pi_* call draws like a native Agent row: one header line and one result line, each
   // cut to the width, never wrapped. They read only the call's own props.
   for (const tool of TOOL_NAMES) {
     on('ui.render', { component: 'ToolUse', props: { tool: `${PREFIX}${tool}` } }, async ($, e) => {
@@ -904,7 +642,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column">
           <Text wrap="truncate-end">
             <Text color={dot}>{DOT} </Text>
-            <Text bold>Codex</Text>({rowArgs(tool, (e.props.input ?? {}) as Record<string, unknown>)})
+            <Text bold>Pi</Text>({rowArgs(tool, (e.props.input ?? {}) as Record<string, unknown>)})
           </Text>
           {!isRunning && (
             <Text wrap="truncate-end">
