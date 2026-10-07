@@ -20,7 +20,7 @@ import {
   toolLine,
   wrapperAnswer,
 } from '../hooks/model'
-import { parseModelList, piCommand, sandboxArgv, sandboxProfile } from '../bin/sandbox.mjs'
+import { parseModelList, piCommand, sandboxArgv, sandboxProfile, sandboxUnavailable } from '../bin/sandbox.mjs'
 import type { PiAgent } from '../types'
 
 // A fake bridge: the relay's stdout is a queue the test pushes NDJSON into,
@@ -308,14 +308,52 @@ test('jobSettings: header > project > userConfig > built-ins; grok fixed, run ne
   expect(() => jobSettings('grok', { body: 'x', approvals: 'never' }, builtIn)).toThrow('approvals: header is not supported')
   expect(() => jobSettings('grok', { body: 'x', sandbox: 'everything' }, builtIn)).toThrow('sandbox must be one of')
   expect(effortFor(builtIn, 'run')).toBe('high')
-  expect(sandboxPlatformError('linux', 'workspace-write')).toContain('needs macOS sandbox-exec')
-  expect(sandboxPlatformError('linux', 'full-access')).toBeUndefined()
+  expect(sandboxPlatformError('linux', 'workspace-write', 'needs bubblewrap (bwrap) on Linux')).toContain('needs bubblewrap')
+  expect(sandboxPlatformError('linux', 'workspace-write', null)).toBeUndefined()
+  expect(sandboxPlatformError('linux', 'full-access', 'needs bubblewrap')).toBeUndefined()
   expect(sandboxPlatformError('darwin', 'read-only')).toBeUndefined()
+  expect(sandboxPlatformError('win32', 'read-only')).toContain('has neither')
   expect(configDirs('/work/app/src', '/work')).toEqual(['/work/app/src', '/work/app', '/work'])
   expect(configDirs('/elsewhere', '/work')).toEqual(['/elsewhere', '/'])
   expect(parseProjectConfig('{"effort":"ultra","model":"xai/grok-4.3"}', 'p.json')).toEqual({ effort: 'max', model: 'xai/grok-4.3' })
   expect(() => parseProjectConfig('{"approvals":"auto"}', 'p.json')).toThrow('"approvals" is not supported')
   expect(agentSpecs(builtIn).map(spec => spec.name)).toEqual(['grok', 'run'])
+})
+
+test('linux sandbox argv: bwrap with read-only root, writable project, tmp and pi state, existing pi entries re-bound read-only', () => {
+  const cmd = ['/usr/bin/pi', '--mode', 'rpc']
+  const agent = '/home/u/.pi/agent'
+  const entries = ['sessions', 'auth.json', 'settings.json', 'models.json', 'extensions', 'skills', 'auth.json.lock', 'models.json']
+  const ws = sandboxArgv({ project: '/home/u/proj', home: '/home/u', mode: 'workspace-write', cmd, platform: 'linux', bwrap: '/usr/bin/bwrap', piAgentEntries: entries })
+  expect(ws).toEqual([
+    '/usr/bin/bwrap',
+    '--ro-bind', '/', '/',
+    '--dev-bind', '/dev', '/dev',
+    '--proc', '/proc',
+    '--bind', '/tmp', '/tmp',
+    '--bind', '/var/tmp', '/var/tmp',
+    '--bind', '/home/u/proj', '/home/u/proj',
+    '--bind', agent, agent,
+    // Every existing entry but sessions/, auth.json and settings.json, sorted and deduplicated.
+    '--ro-bind-try', `${agent}/auth.json.lock`, `${agent}/auth.json.lock`,
+    '--ro-bind-try', `${agent}/extensions`, `${agent}/extensions`,
+    '--ro-bind-try', `${agent}/models.json`, `${agent}/models.json`,
+    '--ro-bind-try', `${agent}/skills`, `${agent}/skills`,
+    '--die-with-parent',
+    '--chdir', '/home/u/proj',
+    ...cmd,
+  ])
+  // No network or pid isolation flags: network stays shared.
+  expect(ws.some(arg => arg.startsWith('--unshare'))).toBe(false)
+  // read-only: same minus the project bind; cwd still the project.
+  const ro = sandboxArgv({ project: '/home/u/proj', home: '/home/u', mode: 'read-only', cmd, platform: 'linux', bwrap: '/usr/bin/bwrap', piAgentEntries: [], tmpdir: '/run/user/1000/tmp' })
+  expect(ro.join(' ')).not.toContain('--bind /home/u/proj')
+  expect(ro.join(' ')).toContain('--bind /run/user/1000/tmp /run/user/1000/tmp')
+  expect(ro.slice(-5)).toEqual(['--chdir', '/home/u/proj', ...cmd])
+  // $TMPDIR=/tmp is not bound twice.
+  const plain = sandboxArgv({ project: '/p', home: '/h', mode: 'read-only', cmd, platform: 'linux', bwrap: 'bwrap', tmpdir: '/tmp' })
+  expect(plain.filter(arg => arg === '/tmp')).toHaveLength(2)
+  expect(() => sandboxArgv({ home: '/h', mode: 'workspace-write', cmd, platform: 'linux', bwrap: 'bwrap' })).toThrow('project is required')
 })
 
 test('sandbox argv: workspace-write allows the project, read-only does not, full-access runs bare, non-macOS refuses', () => {
@@ -344,7 +382,11 @@ test('sandbox argv: workspace-write allows the project, read-only does not, full
   expect(ro.join(' ')).not.toContain('PROJECT')
   expect(sandboxProfile('read-only')).not.toContain('PROJECT')
   expect(sandboxArgv({ project: '/p', home: '/h', mode: 'full-access', cmd, platform: 'linux' })).toEqual(cmd)
-  expect(() => sandboxArgv({ project: '/p', home: '/h', mode: 'workspace-write', cmd, platform: 'linux' })).toThrow('needs macOS sandbox-exec')
+  expect(() => sandboxArgv({ project: '/p', home: '/h', mode: 'workspace-write', cmd, platform: 'linux' })).toThrow('needs bubblewrap (bwrap)')
+  expect(() => sandboxArgv({ project: '/p', home: '/h', mode: 'read-only', cmd, platform: 'linux', bwrap: null })).toThrow('needs bubblewrap (bwrap)')
+  expect(() => sandboxArgv({ project: '/p', home: '/h', mode: 'read-only', cmd, platform: 'win32' })).toThrow('has neither')
+  expect(sandboxUnavailable({ platform: 'darwin' })).toBeUndefined()
+  expect(sandboxUnavailable({ platform: 'linux', bwrap: '/usr/bin/bwrap' })).toBeUndefined()
   expect(() => sandboxArgv({ project: '/p', home: '/h', mode: 'yolo', cmd, platform: 'darwin' })).toThrow('sandbox must be one of')
 
   expect(piCommand({ piPath: 'pi', model: 'xai/grok-4.7', effort: 'high', sandbox: 'workspace-write', sessionFile: null })).toEqual([
@@ -497,10 +539,10 @@ test('header lines set model, effort and sandbox and are stripped; a bad one ref
   done(fake)
 })
 
-test('off macOS a sandboxed spawn is refused; full-access still runs', { timeoutMs: 20_000 }, async ($, on) => {
+test('where the bridge has no sandbox tool a sandboxed spawn is refused; full-access still runs', { timeoutMs: 20_000 }, async ($, on) => {
   const fake = fakeBridge(on)
-  await start($, fake, { platform: 'linux' })
-  expect((await $.agent.spawn(spawnInput('x'))).deny).toContain('needs macOS sandbox-exec')
+  await start($, fake, { platform: 'linux', sandboxUnavailable: 'needs bubblewrap (bwrap) on Linux, and it is not on PATH' })
+  expect((await $.agent.spawn(spawnInput('x'))).deny).toContain('needs bubblewrap (bwrap)')
   await spawn($, fake, 'sandbox: full-access\nx')
   expect(fake.sends[0]?.job).toMatchObject({ sandbox: 'full-access' })
   done(fake)

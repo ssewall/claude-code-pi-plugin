@@ -18,8 +18,8 @@
 //           when the plugin reloads, and the daemon (with its pi processes and
 //           their running turns) must outlive that.
 //   daemon: node bridge.mjs --daemon <piPath> <dir>
-//           Owns one `pi --mode rpc` child per job (wrapped by sandbox-exec, see
-//           sandbox.mjs) and serves HTTP on the Unix socket <dir>/s:
+//           Owns one `pi --mode rpc` child per job (wrapped by sandbox-exec on
+//           macOS or bwrap on Linux, see sandbox.mjs) and serves HTTP on the Unix socket <dir>/s:
 //             GET  /health
 //             GET  /events  NDJSON stream (one subscriber, the relay)
 //             GET  /models  {result: {models}}: provider/id from `pi --list-models`
@@ -43,7 +43,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { parseModelList, piCommand, sandboxArgv } from './sandbox.mjs'
+import { parseModelList, piCommand, sandboxArgv, sandboxUnavailable } from './sandbox.mjs'
 
 const GRACE_MS = 20_000
 const IDLE_MS = 10 * 60_000
@@ -60,6 +60,34 @@ const BUILD = createHash('sha256')
   .update(fs.readFileSync(SANDBOX_SELF))
   .digest('hex')
   .slice(0, 8)
+
+/** bubblewrap's path on Linux (null when missing or off Linux). */
+const BWRAP = (() => {
+  if (process.platform !== 'linux') return null
+  for (const dir of (process.env.PATH ?? '').split(':').concat('/usr/bin', '/bin')) {
+    if (!dir) continue
+    const file = path.join(dir, 'bwrap')
+    try {
+      fs.accessSync(file, fs.constants.X_OK)
+      return file
+    } catch {}
+  }
+  return null
+})()
+/** Why sandboxed modes cannot run here, or null. Reported to the plugin in hello/ready. */
+const SANDBOX_UNAVAILABLE = sandboxUnavailable({ platform: process.platform, bwrap: BWRAP }) ?? null
+
+/** Linux sandbox inputs read from disk at launch: ~/.pi/agent's entries (made if missing) and an existing $TMPDIR. */
+const linuxSandboxInputs = home => {
+  if (process.platform !== 'linux') return {}
+  const agent = path.join(home, '.pi', 'agent')
+  fs.mkdirSync(agent, { recursive: true })
+  let tmpdir
+  try {
+    if (process.env.TMPDIR) tmpdir = fs.realpathSync(process.env.TMPDIR)
+  } catch {}
+  return { bwrap: BWRAP, piAgentEntries: fs.readdirSync(agent), tmpdir }
+}
 
 /** pi events the plugin reads; the rest (streaming deltas, UI chatter, whole-run message lists) stay here. */
 const RELAYED = new Set([
@@ -232,10 +260,12 @@ async function daemon(piPath, dir) {
   /** Starts the job's pi (resuming its session file when it has one); resolves once pi answers get_state. */
   const launch = async (job, spec) => {
     const cwd = fs.realpathSync(spec.cwd)
+    const home = fs.realpathSync(os.homedir())
     const argv = sandboxArgv({
       project: cwd,
-      home: fs.realpathSync(os.homedir()),
+      home,
       mode: spec.sandbox,
+      ...(spec.sandbox === 'full-access' ? {} : linuxSandboxInputs(home)),
       cmd: piCommand({ piPath, model: spec.model, effort: spec.effort, sandbox: spec.sandbox, sessionFile: job.sessionFile }),
     })
     const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
@@ -389,13 +419,13 @@ async function daemon(piPath, dir) {
         })
       }
       if (req.method === 'GET' && url.pathname === '/health') {
-        return sendJson(res, 200, { ok: true, pid: process.pid, build: BUILD, platform: process.platform, active: activeRuns() })
+        return sendJson(res, 200, { ok: true, pid: process.pid, build: BUILD, platform: process.platform, sandboxUnavailable: SANDBOX_UNAVAILABLE, active: activeRuns() })
       }
       if (req.method === 'GET' && url.pathname === '/events') {
         if (subscriber) subscriber.end()
         clearTimeout(graceTimer)
         res.writeHead(200, { 'content-type': 'application/x-ndjson' })
-        res.write(JSON.stringify({ type: 'hello', reattached: everSubscribed, active: activeRuns(), platform: process.platform }) + '\n')
+        res.write(JSON.stringify({ type: 'hello', reattached: everSubscribed, active: activeRuns(), platform: process.platform, sandboxUnavailable: SANDBOX_UNAVAILABLE }) + '\n')
         for (const event of buffer) res.write(JSON.stringify(event) + '\n')
         buffer = []
         subscriber = res
@@ -559,7 +589,7 @@ async function relay(piPath, sessionKey) {
       if (first) {
         first = false
         const hello = JSON.parse(line)
-        out({ type: 'ready', socket: socketPath, reattached: hello.reattached, active: hello.active, platform: hello.platform })
+        out({ type: 'ready', socket: socketPath, reattached: hello.reattached, active: hello.active, platform: hello.platform, sandboxUnavailable: hello.sandboxUnavailable })
         continue
       }
       process.stdout.write(line + '\n')

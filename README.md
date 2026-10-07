@@ -43,7 +43,11 @@ There is no `approvals:` line. pi has no approval hooks, so nothing is ever aske
 
 ## Sandbox
 
-pi runs under macOS `sandbox-exec` with this profile (see `bin/sandbox.mjs`):
+Sandboxed modes work on macOS (with `sandbox-exec`) and Linux (with [bubblewrap](https://github.com/containers/bubblewrap), `bwrap`). The rules are the same on both, apart from one gap on Linux, listed below.
+
+### macOS
+
+pi runs under `sandbox-exec` with this profile (see `bin/sandbox.mjs`):
 
 ```
 (version 1)(allow default)(deny file-write*)
@@ -58,6 +62,39 @@ pi runs under macOS `sandbox-exec` with this profile (see `bin/sandbox.mjs`):
 - `read-only`: the same profile without the project, and pi is started with only its read tools (`--tools read,grep,find,ls`).
 - `full-access`: no sandbox at all. Claude should use it only when you ask for it explicitly.
 
+### Linux
+
+pi runs under `bwrap` (bubblewrap: an unprivileged tool that runs a program in its own view of the filesystem). The command looks like this:
+
+```
+bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc
+      --bind /tmp /tmp --bind /var/tmp /var/tmp [--bind $TMPDIR $TMPDIR]
+      --bind PROJECT PROJECT                      # workspace-write only
+      --bind ~/.pi/agent ~/.pi/agent
+      --ro-bind-try ~/.pi/agent/<entry> ...       # every existing entry but sessions/, auth.json, settings.json
+      --die-with-parent --chdir PROJECT  pi --mode rpc ...
+```
+
+The whole filesystem is mounted read-only, then the writable paths are mounted on top. Network is shared. A write anywhere else fails with "Read-only file system".
+
+- Install bubblewrap first (`sudo apt install bubblewrap` on Debian and Ubuntu). Without it, `workspace-write` and `read-only` refuse to start with an error that says so; only `full-access` runs.
+- **Gap vs macOS:** bwrap can only mount paths that already exist, and pi creates its lock directories (`auth.json.lock`, `settings.json.lock`) on the fly. So all of `~/.pi/agent` is mounted writable, and then each entry already in it (except `sessions/`, `auth.json` and `settings.json`) is mounted read-only again when pi starts. Existing extensions, `npm/`, `models.json` and so on stay read-only, but a sandboxed job **can create new files** in `~/.pi/agent`. A new file there could be one pi reads later (for example a `models.json` that did not exist before), so keep that in mind.
+- On Ubuntu 23.10 and later, AppArmor blocks unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), which bwrap needs. If `bwrap --ro-bind / / true` fails with "Permission denied" or "setting up uid map", give bwrap an AppArmor profile that allows them, for example `/etc/apparmor.d/bwrap`:
+
+  ```
+  abi <abi/4.0>,
+  include <tunables/global>
+  profile bwrap /usr/bin/bwrap flags=(unconfined) {
+    userns,
+  }
+  ```
+
+  then `sudo apparmor_parser -r /etc/apparmor.d/bwrap`.
+
+Any other system: sandboxed modes refuse to start rather than run unconfined.
+
+### Limits
+
 Know what it does not do:
 
 - **Reads are open.** pi can read any file your user can, including `~/.ssh`, `~/.aws` and `.env` files. This matches Codex's `workspace-write`.
@@ -65,8 +102,9 @@ Know what it does not do:
 - **No approvals.** Nothing asks you before a command runs. Inside the writable paths, pi can do anything.
 - `/tmp` is writable in every mode, so a project that lives under `/tmp` is writable even with `read-only` (there, only the read-only tool list stops pi from writing).
 - pi's credential and settings files are writable: `~/.pi/agent/auth.json`, `~/.pi/agent/settings.json`, and their lock directories `auth.json.lock` and `settings.json.lock`. pi locks each file (by creating the `.lock` directory) before it reads it, so without these pi cannot read your API keys at all, and it rewrites `auth.json` when it refreshes an OAuth token (xAI login, for example). **Tradeoff:** a sandboxed job can overwrite `auth.json` and `settings.json`. Nothing else in `~/.pi` is writable: not extensions, `npm/`, or `models.json`.
-- Sandboxed modes need macOS. On other systems `workspace-write` and `read-only` refuse to start rather than run unconfined; only `full-access` runs.
+- Sandboxed modes need macOS or Linux with bwrap. Elsewhere `workspace-write` and `read-only` refuse to start rather than run unconfined; only `full-access` runs.
 - `sandbox-exec` is deprecated by Apple but still works.
+- On Linux, `/tmp` and `/var/tmp` (and `$TMPDIR`) are the temp dirs that stay writable.
 
 ## Install
 
@@ -88,7 +126,7 @@ claude plugin install pi@pi-plugin
 - Claude Code with the hooks plugin API (function hooks, currently early access).
 - pi 1.0 or newer (`pi --mode rpc`), with credentials for the providers you use (`pi auth`).
 - Node 18 or newer.
-- macOS for the sandboxed modes.
+- macOS, or Linux with `bwrap`, for the sandboxed modes.
 
 ## Tools
 
@@ -124,7 +162,7 @@ A project can set its own defaults in `.claude/pi.json`. The plugin uses the nea
 
 ## Architecture
 
-The hooks module (`hooks/register.tsx`, with the pure logic in `hooks/model.ts`) starts `bin/bridge.mjs` as a relay. The relay launches a detached daemon, or reattaches to one still running, in `/tmp/pxb-<uid>/<session>-<build>/` (the codex plugin uses `/tmp/cxb-<uid>/`, so the two never meet). The daemon serves HTTP on a Unix socket there and owns one `pi --mode rpc` child per job, wrapped by `sandbox-exec`. It talks JSONL to each child on stdin and stdout and relays the events the plugin needs as NDJSON.
+The hooks module (`hooks/register.tsx`, with the pure logic in `hooks/model.ts`) starts `bin/bridge.mjs` as a relay. The relay launches a detached daemon, or reattaches to one still running, in `/tmp/pxb-<uid>/<session>-<build>/` (the codex plugin uses `/tmp/cxb-<uid>/`, so the two never meet). The daemon serves HTTP on a Unix socket there and owns one `pi --mode rpc` child per job, wrapped by `sandbox-exec` (macOS) or `bwrap` (Linux). It talks JSONL to each child on stdin and stdout and relays the events the plugin needs as NDJSON.
 
 | Plugin action | pi RPC |
 | --- | --- |

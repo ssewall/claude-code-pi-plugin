@@ -5,9 +5,16 @@
 // the four ~/.pi/agent paths pi's credential and settings stores write (see
 // PI_STATE_FILES).
 // read-only: the same minus the project, and pi gets only its read tools.
-// full-access: no sandbox-exec at all. Reads and network stay open in every
-// mode. macOS only: elsewhere a sandboxed mode refuses to start rather than run
-// unconfined.
+// full-access: no sandbox at all. Reads and network stay open in every mode.
+//
+// Linux uses bubblewrap (bwrap) instead: the whole filesystem read-only, then
+// writable binds for the project (workspace-write), /tmp, /var/tmp, $TMPDIR and
+// pi's state. bwrap cannot bind a path that does not exist yet (pi's `*.lock`
+// dirs), so all of ~/.pi/agent is bound writable and then every entry already
+// in it, except sessions/, auth.json and settings.json, is re-bound read-only.
+// Gap vs macOS: the agent can create new files in ~/.pi/agent.
+// Any other platform, or Linux without bwrap: a sandboxed mode refuses to start
+// rather than run unconfined.
 
 // No imports: the plugin's tests load this file, and they may import nothing but
 // relative files. Callers pass real paths (the bridge resolves them first).
@@ -37,26 +44,64 @@ export function sandboxProfile(mode) {
   return `(version 1)(allow default)(deny file-write*)(allow file-write* ${writable.join(' ')})`
 }
 
+// Entries of ~/.pi/agent that stay writable on Linux (sessions/ is pi's session
+// store; the two files are rewritten in place, see PI_STATE_FILES).
+export const PI_AGENT_WRITABLE = ['sessions', 'auth.json', 'settings.json']
+
+/** Undefined when `platform` can confine a sandboxed mode; otherwise why not. */
+export function sandboxUnavailable({ platform, bwrap }) {
+  if (platform === 'darwin') return undefined
+  if (platform === 'linux') {
+    return bwrap ? undefined : 'needs bubblewrap (bwrap) on Linux, and it is not on PATH; install it (e.g. apt install bubblewrap)'
+  }
+  return `needs macOS sandbox-exec or Linux bubblewrap; ${platform} has neither`
+}
+
 /**
- * The argv that runs `cmd` under `mode`: sandbox-exec around it, or `cmd`
- * itself for full-access. Throws on an unknown mode, and on a sandboxed mode
- * off macOS. `project` and `home` must be real paths: sandbox-exec matches
- * resolved paths (/tmp is /private/tmp).
+ * The argv that runs `cmd` under `mode`: sandbox-exec (macOS) or bwrap (Linux)
+ * around it, or `cmd` itself for full-access. Throws on an unknown mode, and on
+ * a sandboxed mode where no sandbox tool is available. `project` and `home`
+ * must be real paths: sandbox-exec matches resolved paths (/tmp is
+ * /private/tmp). Linux only: `bwrap` is its path (null when missing),
+ * `piAgentEntries` the names now in ~/.pi/agent, `tmpdir` an existing $TMPDIR.
  */
-export function sandboxArgv({ project, home, mode, cmd, platform = globalThis.process?.platform }) {
+export function sandboxArgv({ project, home, mode, cmd, platform = globalThis.process?.platform, bwrap, piAgentEntries = [], tmpdir }) {
   if (!SANDBOXES.includes(mode)) throw new Error(`sandbox must be one of ${SANDBOXES.join(', ')}`)
   if (!Array.isArray(cmd) || cmd.length === 0) throw new Error('cmd must be a non-empty argv')
   if (mode === 'full-access') return [...cmd]
-  if (platform !== 'darwin') {
-    throw new Error(`sandbox ${mode} needs macOS sandbox-exec; on ${platform} only sandbox: full-access runs (unconfined)`)
-  }
+  const unavailable = sandboxUnavailable({ platform, bwrap })
+  if (unavailable) throw new Error(`sandbox ${mode} ${unavailable}; only sandbox: full-access runs (unconfined)`)
   if (!home) throw new Error('home is required for a sandboxed mode')
+  if (mode === 'workspace-write' && !project) throw new Error('project is required for workspace-write')
+  if (platform === 'linux') return bwrapArgv({ project, home, mode, cmd, bwrap, piAgentEntries, tmpdir })
   const params = ['-D', `HOME=${home}`]
-  if (mode === 'workspace-write') {
-    if (!project) throw new Error('project is required for workspace-write')
-    params.push('-D', `PROJECT=${project}`)
-  }
+  if (mode === 'workspace-write') params.push('-D', `PROJECT=${project}`)
   return ['/usr/bin/sandbox-exec', '-p', sandboxProfile(mode), ...params, ...cmd]
+}
+
+/** The bubblewrap argv (Linux); see the header comment for the layout. */
+function bwrapArgv({ project, home, mode, cmd, bwrap, piAgentEntries, tmpdir }) {
+  const bind = dir => ['--bind', dir, dir]
+  const agent = `${home}/.pi/agent`
+  const readOnly = [...new Set(piAgentEntries)]
+    .filter(name => name && !name.includes('/') && name !== '.' && name !== '..' && !PI_AGENT_WRITABLE.includes(name))
+    .sort()
+  return [
+    bwrap,
+    '--ro-bind', '/', '/',
+    '--dev-bind', '/dev', '/dev',
+    '--proc', '/proc',
+    ...bind('/tmp'),
+    ...bind('/var/tmp'),
+    ...(tmpdir && tmpdir !== '/tmp' && tmpdir !== '/var/tmp' ? bind(tmpdir) : []),
+    ...(mode === 'workspace-write' ? bind(project) : []),
+    ...bind(agent),
+    // -try: an entry removed since it was listed is skipped, not fatal.
+    ...readOnly.flatMap(name => ['--ro-bind-try', `${agent}/${name}`, `${agent}/${name}`]),
+    '--die-with-parent',
+    ...(project ? ['--chdir', project] : []),
+    ...cmd,
+  ]
 }
 
 /** The `pi --mode rpc` command line for a job (before sandboxArgv wraps it). */

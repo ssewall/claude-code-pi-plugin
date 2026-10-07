@@ -6,7 +6,7 @@
 //   calls pi_await until the turn ends, then answers the pi final message.
 //
 //   this module --$.http.fetch(socketPath)--> bin/bridge.mjs daemon
-//   --JSONL over stdio--> one `pi --mode rpc` per job (under sandbox-exec);
+//   --JSONL over stdio--> one `pi --mode rpc` per job (under sandbox-exec or bwrap);
 //   the relay's stdout (NDJSON events) --$.process.spawn--> onEvent
 //
 // Every engine call lives in this file (the engine follows `$` only within
@@ -89,8 +89,9 @@ let socket: Socket | null = null
 let isBridgeRunning = false
 /** The userConfig the bridge starts with; set when the module registers. */
 let bridgeSettings: Settings | null = null
-/** The bridge's platform, from its ready line (sandboxed modes need darwin). */
+/** The bridge's platform and sandbox verdict, from its ready line (sandboxed modes need sandbox-exec or bwrap). */
 let bridgePlatform: string | undefined
+let bridgeSandboxUnavailable: string | null | undefined
 /** Subagents seen at turn.step that are not pi:* agents. */
 const foreignAgents = new Set<string>()
 let models: string[] | null = null
@@ -176,6 +177,7 @@ async function startBridge($: Engine): Promise<void> {
     }
     if (event.type === 'ready') {
       bridgePlatform = event.platform
+      bridgeSandboxUnavailable = event.sandboxUnavailable
       current.resolve(event.socket)
     }
     if (event.type === 'fatal') current.reject(new PiError(`pi bridge failed: ${event.message}`))
@@ -518,7 +520,7 @@ export const register: Register = (on, options) => {
       const unknown = unknownModelError(await listModels($), job.model)
       if (unknown) return { deny: `pi: ${unknown}` }
       await bridgeSocket($)
-      const platform = sandboxPlatformError(bridgePlatform, job.sandbox)
+      const platform = sandboxPlatformError(bridgePlatform, job.sandbox, bridgeSandboxUnavailable)
       if (platform) return { deny: `pi: ${platform}` }
       input = {
         description: taskLabel(e),

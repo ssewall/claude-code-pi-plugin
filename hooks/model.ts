@@ -19,7 +19,7 @@ export type Settings = {
 export type Turn = { id: string; status: string; text: string; error: string | null }
 
 export type BridgeEvent =
-  | { type: 'ready'; socket: string; reattached: boolean; active: Record<string, string>; platform?: string }
+  | { type: 'ready'; socket: string; reattached: boolean; active: Record<string, string>; platform?: string; sandboxUnavailable?: string | null }
   | { type: 'event'; jobId: string; turnId: string | null; event: PiEvent }
   | { type: 'turn_end'; jobId: string; turn: Turn }
   | { type: 'exit'; jobId: string; code: number | null; signal: string | null; stderrTail: string[] }
@@ -353,11 +353,20 @@ export function jobSettings(kind: string, header: PromptHeader, defaults: Defaul
 export const unknownModelError = (models: readonly string[], model: string): string | undefined =>
   models.includes(model) ? undefined : `pi does not know model "${model}" (see \`pi --list-models\`).`
 
-/** Undefined when the platform can run the sandbox; otherwise why not. */
-export const sandboxPlatformError = (platform: string | undefined, sandbox: PiSandbox): string | undefined =>
-  sandbox === 'full-access' || platform === undefined || platform === 'darwin'
-    ? undefined
-    : `sandbox ${sandbox} needs macOS sandbox-exec; on ${platform} only "sandbox: full-access" runs, unconfined`
+/**
+ * Undefined when the bridge's host can run the sandbox; otherwise why not.
+ * `unavailable` is the bridge's own verdict (sandbox.mjs sandboxUnavailable):
+ * macOS uses sandbox-exec, Linux bubblewrap.
+ */
+export const sandboxPlatformError = (
+  platform: string | undefined,
+  sandbox: PiSandbox,
+  unavailable?: string | null,
+): string | undefined => {
+  if (sandbox === 'full-access' || platform === undefined) return undefined
+  const why = unavailable ?? (platform === 'darwin' || platform === 'linux' ? undefined : `needs macOS sandbox-exec or Linux bubblewrap; ${platform} has neither`)
+  return why ? `sandbox ${sandbox} ${why}; only "sandbox: full-access" runs, unconfined` : undefined
+}
 
 // ------------------------------------------------------------ native agent types
 
@@ -398,7 +407,7 @@ export function agentDescription(kind: string, defaults: Defaults): string {
     'Optional header lines at the top of the prompt, stripped before pi sees it:',
     ...(kind === 'run' ? ['"model: provider/id";'] : []),
     `"effort: ${EFFORT_CHOICES}";`,
-    `"sandbox: read-only|workspace-write|full-access" (macOS sandbox-exec; workspace-write writes only in the cwd, /tmp and pi's session dir; read-only also limits pi to its read tools; reads and network stay open; default ${defaults.sandbox}).`,
+    `"sandbox: read-only|workspace-write|full-access" (macOS sandbox-exec, Linux bubblewrap; workspace-write writes only in the cwd, /tmp and pi's session dir; read-only also limits pi to its read tools; reads and network stay open; default ${defaults.sandbox}).`,
     'No approvals: pi asks nobody; full-access ONLY when the user explicitly asked for it.',
     `Project defaults: ${PROJECT_CONFIG}.`,
     'SendMessage to it steers the running pi turn, or starts a new turn in the same pi session once it finished; TaskStop aborts it.',

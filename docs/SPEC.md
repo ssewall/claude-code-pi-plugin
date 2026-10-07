@@ -57,7 +57,7 @@ Run non-Claude models (via the `pi` CLI) as native background subagents in Claud
 - End-to-end → the Agent tool (`pi:grok`, `pi:run`) + `pi_list`/`pi_result`, exercised manually in a Claude Code session (criteria 2–7, 9).
 
 ## Constraints
-- macOS only for sandboxed modes. Node 18+. Claude Code with the function-hooks plugin API.
+- macOS (sandbox-exec) or Linux (bwrap) for sandboxed modes; see the addendum. Node 18+. Claude Code with the function-hooks plugin API.
 - Live model calls in done criteria use xai credits; keep test prompts tiny.
 - Don't touch the installed codex plugin.
 
