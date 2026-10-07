@@ -147,9 +147,15 @@ function newSocket(): Socket {
   return { promise, resolve, reject }
 }
 
-/** The configured binary when it is on disk, else its bare name, which the spawn finds on PATH. */
+/** Where Homebrew, system packages and user-level npm installs put binaries, checked after the configured path. */
+const BINARY_DIRS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '~/.local/bin', '~/.local/npm/bin', '~/.npm-global/bin']
+
+/** The configured binary when it is on disk, else the first well-known install of it, else its bare name, which the spawn finds on PATH. */
 async function resolveBinary($: Engine, configured: string, name: string): Promise<string> {
-  return (await $.fs.exists(configured)) ? configured : name
+  const home = (await $.env.get('HOME')) ?? ''
+  const candidates = [configured, ...BINARY_DIRS.map(dir => `${dir.replace(/^~/, home)}/${name}`)]
+  for (const path of candidates) if (path && (await $.fs.exists(path))) return path
+  return name
 }
 
 /** Starts the relay, unless it runs; its events reach `onEvent` in order until the daemon exits (the session ended, or it sat idle). */

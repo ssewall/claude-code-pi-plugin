@@ -147,8 +147,8 @@ Set these in the install screen or the plugin's config menu (`userConfig`):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `piPath` | `/opt/homebrew/bin/pi` | The pi CLI. If the path does not exist, `pi` is looked up on PATH. |
-| `nodePath` | `/opt/homebrew/bin/node` | Node used to run the bridge (and pi, which is a Node script). If the path does not exist, `node` is looked up on PATH. |
+| `piPath` | empty | The pi CLI. When unset or missing, the plugin tries `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `~/.local/bin`, `~/.local/npm/bin`, `~/.npm-global/bin`, then PATH. |
+| `nodePath` | empty | Node used to run the bridge (and pi, which is a Node script). Found the same way as `piPath`. |
 | `defaultEffort` | `per-model` | `per-model` uses each agent's own default (high). Any other level applies to every agent. |
 | `defaultSandbox` | `workspace-write` | read-only, workspace-write, full-access. |
 

@@ -121,6 +121,7 @@ function fakeBridge(on: On, stored: Record<string, unknown> = {}, files: Record<
   on('session.cwd', () => ({ value: '/work/app' }))
   on('session.root', () => ({ value: '/work' }))
   on('fs.exists', (_$, e) => ({ value: e.path in fake.files }))
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
   on('fs.read', (_$, e) => (e.path in fake.files ? { value: fake.files[e.path] as string } : { deny: `no file ${e.path}` }))
   on('ui.log', () => ({ value: undefined }))
 
@@ -468,6 +469,22 @@ test('registers pi:grok and pi:run, run on haiku with pi_await alone', async ($,
   expect(grok).not.toContain('"model: provider/id"')
   expect(String(fake.registeredAgents[1]?.description)).toContain('"model: provider/id"')
   done(fake)
+})
+
+test('pi and node are found in common install folders, else by bare name on PATH', async ($, on) => {
+  const found = fakeBridge(on, {}, { '/home/u/.local/npm/bin/pi': '', '/usr/bin/node': '' })
+  await start($, found)
+  expect(found.argv[0]).toBe('/usr/bin/node')
+  expect(found.argv[2]).toBe('/home/u/.local/npm/bin/pi')
+  done(found)
+})
+
+test('with nothing installed in a known folder, the bridge spawns bare pi and node', async ($, on) => {
+  const bare = fakeBridge(on, {}, {})
+  await start($, bare)
+  expect(bare.argv[0]).toBe('node')
+  expect(bare.argv[2]).toBe('pi')
+  done(bare)
 })
 
 test('a pi:grok spawn sends the exact prompt with its job spec, keyed by the agentId; events update it', { timeoutMs: 20_000 }, async ($, on) => {

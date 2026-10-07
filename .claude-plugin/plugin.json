@@ -10,14 +10,14 @@
     "piPath": {
       "type": "string",
       "title": "pi binary",
-      "description": "Path to the pi CLI binary (needs `pi --mode rpc`). When this path does not exist, `pi` is looked up on PATH.",
-      "default": "/opt/homebrew/bin/pi"
+      "description": "Path to the pi CLI binary (needs `pi --mode rpc`). Leave empty to search common install folders, then PATH.",
+      "default": ""
     },
     "nodePath": {
       "type": "string",
       "title": "Node binary",
-      "description": "Node 18+ used to run the bridge process (and pi). When this path does not exist, `node` is looked up on PATH.",
-      "default": "/opt/homebrew/bin/node"
+      "description": "Node 18+ used to run the bridge process (and pi). Leave empty to search common install folders, then PATH.",
+      "default": ""
     },
     "defaultEffort": {
       "type": "string",
