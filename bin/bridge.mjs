@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Bridge between the codex plugin and `codex app-server`.
+// Bridge between the pi plugin and `pi --mode rpc` processes.
 //
-// Two roles in one file:
-//   relay:  node bridge.mjs <codexPath> <sessionKey>
+// Three roles in one file:
+//   relay:  node bridge.mjs <piPath> <sessionKey>
 //           Started by the plugin with $.process.spawn. Finds (or starts) the
 //           daemon for this Claude session and this build of the bridge (the
 //           daemon's directory is <sessionKey>-<BUILD>, so a reload onto another
@@ -11,73 +11,68 @@
 //           {"type":"ready","socket",...}. It exits when its parent goes away,
 //           stdout breaks or the daemon exits; the plugin killing it on reload is
 //           expected and harmless.
-//   launch: node bridge.mjs --launch <codexPath> <dir>
+//   launch: node bridge.mjs --launch <piPath> <dir>
 //           Started detached by the relay; starts the daemon detached, writes
 //           its pid to <dir>/pid and exits at once. The daemon is thus never a
 //           descendant of the relay: the engine kills the relay's whole tree
-//           when the plugin reloads, and the daemon (with codex and its
-//           running turns) must outlive that.
-//   daemon: node bridge.mjs --daemon <codexPath> <dir>
-//           Owns one `codex app-server --listen stdio://` and serves HTTP on
-//           the Unix socket <dir>/s:
+//           when the plugin reloads, and the daemon (with its pi processes and
+//           their running turns) must outlive that.
+//   daemon: node bridge.mjs --daemon <piPath> <dir>
+//           Owns one `pi --mode rpc` child per job (wrapped by sandbox-exec, see
+//           sandbox.mjs) and serves HTTP on the Unix socket <dir>/s:
 //             GET  /health
-//             GET  /events           NDJSON stream (one subscriber, the relay)
-//             POST /rpc   {method, params, timeoutMs?} -> {result} | {error}
-//             POST /reply {id, result} | {id, error}   answers a server request
-//             POST /wait  {threadId, msgKey?, timeoutMs} long-poll for turn end or a codex-msg message
-//             POST /msg   {key, text}                  bin/codex-msg: a message from a Codex job
+//             GET  /events  NDJSON stream (one subscriber, the relay)
+//             GET  /models  {result: {models}}: provider/id from `pi --list-models`
+//             POST /send    {job, text} -> {result: {action: steered|started, turnId, sessionFile}}
+//                           steers the running turn, else prompts (relaunching
+//                           pi with --session when its process is gone)
+//             POST /abort   {jobId}             aborts the running turn
+//             POST /wait    {jobId, timeoutMs}  long-poll for the turn's end
+//             POST /release {jobId}             stops the job's pi process
 //           While no relay is attached it buffers events (so a plugin reload
-//           loses nothing) and exits, killing codex, after GRACE_MS alone. With a
-//           relay attached it exits after IDLE_MS with no turn running and no
-//           request in flight; the plugin starts a new one when it next needs
-//           Codex. Codex stops a thread's MCP servers (bin/codex-msg among them)
-//           when it unloads the thread, and all of them when it exits. It also
-//           stops daemons of bridge builds that predate this lifecycle (their
-//           directory is the bare session key) once it has seen them run no
-//           turn for LEGACY_IDLE_MS.
+//           loses nothing) and exits, killing every pi, after GRACE_MS alone.
+//           With a relay attached it exits after IDLE_MS with no turn running
+//           and no request in flight; the plugin starts a new one when it next
+//           needs pi, and a job's next message relaunches pi on its session file.
 
-import { spawn } from 'node:child_process'
+import { spawn, execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
 import path from 'node:path'
-import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+
+import { parseModelList, piCommand, sandboxArgv } from './sandbox.mjs'
 
 const GRACE_MS = 20_000
 const IDLE_MS = 10 * 60_000
 const IDLE_CHECK_MS = 60_000
-/** Half the idle window, so a daemon about to idle out itself still stops an idle legacy one. */
-const LEGACY_IDLE_MS = IDLE_MS / 2
 const BUFFER_CAP = 5_000
-const MAILBOX_CAP = 50
-const MESSAGE_CAP = 20_000
-/** What a codex-msg delivery hands a waiting /wait. */
-const MAIL = Symbol('mail')
+/** After agent_end (no retry), how long to wait for agent_settled before ending the turn anyway. */
+const SETTLE_FALLBACK_MS = 3_000
 const SELF = fileURLToPath(import.meta.url)
-/** Names this bridge build: its path and its code. */
-const BUILD = createHash('sha256').update(SELF).update(fs.readFileSync(SELF)).digest('hex').slice(0, 8)
-/** A daemon directory of a build before BUILD was part of it: the session key alone. */
-const isLegacyDir = name => /^[A-Za-z0-9]+$/.test(name)
+const SANDBOX_SELF = path.join(path.dirname(SELF), 'sandbox.mjs')
+/** Names this bridge build: its path and its code (sandbox.mjs included). */
+const BUILD = createHash('sha256')
+  .update(SELF)
+  .update(fs.readFileSync(SELF))
+  .update(fs.readFileSync(SANDBOX_SELF))
+  .digest('hex')
+  .slice(0, 8)
 
-// Notifications the plugin never reads: streaming deltas and chatter.
-const NOISE = new Set([
-  'account/rateLimits/updated',
-  'mcpServer/startupStatus/updated',
-  'warning',
-  'configWarning',
-  'deprecationNotice',
-  'guardianWarning',
-  'skills/changed',
-  'fs/changed',
-  'turn/diff/updated',
-  'item/reasoning/summaryPartAdded',
-  'item/commandExecution/terminalInteraction',
-  'item/fileChange/patchUpdated',
-  'thread/settings/updated',
+/** pi events the plugin reads; the rest (streaming deltas, UI chatter, whole-run message lists) stay here. */
+const RELAYED = new Set([
+  'agent_start',
+  'turn_start',
+  'message_end',
+  'tool_execution_start',
+  'tool_execution_end',
+  'auto_retry_start',
+  'auto_retry_end',
+  'compaction_start',
+  'compaction_end',
 ])
-const isNoise = method =>
-  NOISE.has(method) || /[dD]elta$/.test(method) || method.startsWith('rawResponse')
 
 const readBody = req =>
   new Promise((resolve, reject) => {
@@ -100,110 +95,263 @@ const sendJson = (res, status, value) => {
   res.end(body)
 }
 
+/** Calls `onLine` per LF-terminated record (pi's JSONL may hold U+2028 inside strings, which readline would split on). */
+const jsonLines = (stream, onLine) => {
+  let pending = ''
+  stream.setEncoding('utf8')
+  stream.on('data', chunk => {
+    pending += chunk
+    let at
+    while ((at = pending.indexOf('\n')) >= 0) {
+      const line = pending.slice(0, at).replace(/\r$/, '')
+      pending = pending.slice(at + 1)
+      if (line.trim() !== '') onLine(line)
+    }
+  })
+}
+
+/** The text of an assistant message's text blocks. */
+const assistantText = message =>
+  Array.isArray(message?.content)
+    ? message.content
+        .filter(part => part?.type === 'text' && typeof part.text === 'string')
+        .map(part => part.text)
+        .join('')
+    : typeof message?.content === 'string'
+      ? message.content
+      : ''
+
 // ---------------------------------------------------------------- daemon
 
-async function daemon(codexPath, dir) {
+async function daemon(piPath, dir) {
   const socketPath = path.join(dir, 's')
-  const codex = spawn(codexPath, ['app-server', '--listen', 'stdio://'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  // A codex that cannot start: say why in daemon.log (the relay reports its tail).
-  codex.on('error', error => {
-    process.stderr.write(`cannot start ${codexPath}: ${error.message}\n`)
-    process.exit(1)
-  })
-  const stderrTail = []
-  readline.createInterface({ input: codex.stderr }).on('line', line => {
-    stderrTail.push(line)
-    if (stderrTail.length > 40) stderrTail.shift()
-  })
-
-  let nextId = 1
-  const pending = new Map() // our request id -> {resolve, timer}
-  const outstanding = new Map() // server request id -> event
-  const active = new Map() // threadId -> running turnId
-  const lastTurn = new Map() // threadId -> last completed turn
-  const waiters = new Map() // threadId -> Set<(value) => void>
-  const mailboxes = new Map() // codex-msg key -> texts not yet read
-  const mailWaiters = new Map() // codex-msg key -> Set<(value) => void>
-  const drainMail = key => {
-    const messages = mailboxes.get(key) ?? []
-    mailboxes.delete(key)
-    return messages
-  }
+  /** jobId -> job: its pi child, the running turn and the last one. */
+  const jobs = new Map()
+  const waiters = new Map() // jobId -> Set<(value) => void>
   let buffer = []
   let subscriber = null
   let graceTimer = null
   let everSubscribed = false
-  /** Requests other than /events being served, and when the daemon was last in use. */
   let inFlight = 0
   let lastUse = Date.now()
+  let runCounter = 0
+  let models = null
+  // pi is a node script: let it find the node this bridge runs on.
+  const childEnv = { ...process.env, PATH: `${path.dirname(process.execPath)}:${process.env.PATH ?? ''}` }
 
   const emit = event => {
     if (subscriber) subscriber.write(JSON.stringify(event) + '\n')
-    else if (event.type !== 'request') {
+    else {
       buffer.push(event)
       if (buffer.length > BUFFER_CAP) buffer = buffer.slice(-BUFFER_CAP)
     }
   }
 
-  const writeCodex = message => codex.stdin.write(JSON.stringify(message) + '\n')
+  const activeRuns = () =>
+    Object.fromEntries([...jobs.values()].filter(job => job.run).map(job => [job.id, job.run.id]))
 
-  const rpc = (method, params, timeoutMs = 60_000) =>
-    new Promise(resolve => {
-      const id = nextId++
-      const timer = setTimeout(() => {
-        pending.delete(id)
-        resolve({ error: { code: -32000, message: `${method} timed out after ${timeoutMs} ms` } })
-      }, timeoutMs)
-      pending.set(id, { resolve, timer })
-      writeCodex(params === undefined ? { id, method } : { id, method, params })
-    })
-
-  const settleWaiters = (threadId, value) => {
-    const set = waiters.get(threadId)
+  const settleWaiters = (jobId, value) => {
+    const set = waiters.get(jobId)
     if (!set) return
-    waiters.delete(threadId)
+    waiters.delete(jobId)
     for (const done of set) done(value)
   }
 
-  const onCodexMessage = message => {
-    if (message.id !== undefined && message.method === undefined) {
-      const entry = pending.get(message.id)
-      if (!entry) return
-      pending.delete(message.id)
-      clearTimeout(entry.timer)
-      entry.resolve(message.error ? { error: message.error } : { result: message.result })
-      return
+  /** One RPC command to a job's pi; resolves its response ({success, data} | {success: false, error}). */
+  const command = (job, type, fields = {}, timeoutMs = 60_000) =>
+    new Promise(resolve => {
+      if (!job.child || job.exited) return resolve({ success: false, error: 'the pi process is not running' })
+      const id = `b${job.nextId++}`
+      const timer = setTimeout(() => {
+        job.pending.delete(id)
+        resolve({ success: false, error: `${type} timed out after ${timeoutMs} ms` })
+      }, timeoutMs)
+      job.pending.set(id, { resolve, timer })
+      job.child.stdin.write(JSON.stringify({ id, type, ...fields }) + '\n')
+    })
+
+  /** Ends the job's running turn and tells the plugin and any waiter. */
+  const finishRun = async (job, override) => {
+    const run = job.run
+    if (!run || run.finishing) return
+    run.finishing = true
+    clearTimeout(run.settleTimer)
+    let text = assistantText(run.lastAssistant)
+    if (text === '' && !job.exited) {
+      const last = await command(job, 'get_last_assistant_text', {}, 10_000)
+      if (last.success && typeof last.data?.text === 'string') text = last.data.text
     }
-    if (message.id !== undefined) {
-      const event = { type: 'request', id: message.id, method: message.method, params: message.params ?? {} }
-      outstanding.set(message.id, event)
-      emit(event)
-      return
+    const stop = run.lastAssistant?.stopReason
+    let status = 'completed'
+    let error = null
+    if (override) ({ status, error } = override)
+    else if (run.aborting || stop === 'aborted') status = 'interrupted'
+    else if (stop === 'error') {
+      status = 'failed'
+      error = run.lastAssistant?.errorMessage ?? 'the model call failed'
     }
-    const { method, params = {} } = message
-    if (method === 'turn/started' && params.turn?.id) active.set(params.threadId, params.turn.id)
-    if (method === 'turn/completed' && params.turn) {
-      active.delete(params.threadId)
-      lastTurn.set(params.threadId, params.turn)
-      lastUse = Date.now()
-    }
-    if (method === 'serverRequest/resolved' && params.requestId !== undefined) outstanding.delete(params.requestId)
-    if (!isNoise(method)) emit({ type: 'notification', method, params })
-    if (method === 'turn/completed' && params.turn) settleWaiters(params.threadId, { status: 'completed', turn: params.turn })
+    const turn = { id: run.id, status, text, error }
+    if (job.run === run) job.run = null
+    job.lastTurn = turn
+    lastUse = Date.now()
+    emit({ type: 'turn_end', jobId: job.id, turn })
+    settleWaiters(job.id, { status: 'completed', turn })
   }
 
-  readline.createInterface({ input: codex.stdout }).on('line', line => {
-    if (line.trim() === '') return
-    let message
-    try {
-      message = JSON.parse(line)
-    } catch {
+  const onPiRecord = (job, record) => {
+    if (record.type === 'response') {
+      const entry = record.id !== undefined ? job.pending.get(record.id) : undefined
+      if (!entry) return
+      job.pending.delete(record.id)
+      clearTimeout(entry.timer)
+      entry.resolve(record)
       return
     }
-    onCodexMessage(message)
-  })
+    if (record.type === 'extension_ui_request') {
+      // No person to ask here: every dialog an extension opens is cancelled.
+      if (['select', 'confirm', 'input', 'editor'].includes(record.method)) {
+        job.child.stdin.write(JSON.stringify({ type: 'extension_ui_response', id: record.id, cancelled: true }) + '\n')
+      }
+      return
+    }
+    const run = job.run
+    if (run) {
+      if (record.type === 'agent_start') clearTimeout(run.settleTimer)
+      if (record.type === 'message_end' && record.message?.role === 'assistant') run.lastAssistant = record.message
+      if (record.type === 'agent_end') {
+        const last = (record.messages ?? []).filter(message => message?.role === 'assistant').at(-1)
+        if (last) run.lastAssistant = last
+        clearTimeout(run.settleTimer)
+        if (record.willRetry !== true) run.settleTimer = setTimeout(() => void finishRun(job), SETTLE_FALLBACK_MS)
+      }
+      if (record.type === 'agent_settled') void finishRun(job)
+    }
+    if (RELAYED.has(record.type)) emit({ type: 'event', jobId: job.id, turnId: run?.id ?? null, event: record })
+  }
+
+  /** Starts the job's pi (resuming its session file when it has one); resolves once pi answers get_state. */
+  const launch = async (job, spec) => {
+    const cwd = fs.realpathSync(spec.cwd)
+    const argv = sandboxArgv({
+      project: cwd,
+      home: fs.realpathSync(os.homedir()),
+      mode: spec.sandbox,
+      cmd: piCommand({ piPath, model: spec.model, effort: spec.effort, sandbox: spec.sandbox, sessionFile: job.sessionFile }),
+    })
+    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
+    job.child = child
+    job.exited = false
+    job.stderrTail = []
+    const started = new Promise((resolve, reject) => {
+      child.once('error', error => reject(new Error(`cannot start pi (${piPath}): ${error.message}`)))
+      child.once('spawn', resolve)
+    })
+    child.stdin.on('error', () => undefined)
+    jsonLines(child.stdout, line => {
+      let record
+      try {
+        record = JSON.parse(line)
+      } catch {
+        return
+      }
+      onPiRecord(job, record)
+    })
+    jsonLines(child.stderr, line => {
+      job.stderrTail.push(line)
+      if (job.stderrTail.length > 40) job.stderrTail.shift()
+    })
+    child.on('exit', (code, signal) => {
+      if (job.child !== child) return
+      job.exited = true
+      for (const { resolve, timer } of job.pending.values()) {
+        clearTimeout(timer)
+        resolve({ success: false, error: `pi exited (${code ?? signal}): ${job.stderrTail.slice(-3).join(' | ')}` })
+      }
+      job.pending.clear()
+      emit({ type: 'exit', jobId: job.id, code, signal, stderrTail: job.stderrTail.slice(-10) })
+      if (job.run) {
+        const why = job.run.aborting ? null : `pi exited (${code ?? signal}): ${job.stderrTail.slice(-3).join(' | ')}`
+        void finishRun(job, why === null ? { status: 'interrupted', error: null } : { status: 'failed', error: why })
+      }
+    })
+    await started
+    const state = await command(job, 'get_state', {}, 30_000)
+    if (!state.success) throw new Error(`pi did not start: ${state.error}`)
+    if (typeof state.data?.sessionFile === 'string') job.sessionFile = state.data.sessionFile
+  }
+
+  const jobFor = spec => {
+    let job = jobs.get(spec.id)
+    if (!job) {
+      job = { id: spec.id, child: null, exited: true, pending: new Map(), nextId: 1, run: null, lastTurn: null, sessionFile: spec.sessionFile ?? null, stderrTail: [], queue: Promise.resolve() }
+      jobs.set(spec.id, job)
+    }
+    return job
+  }
+
+  /** Runs `work` after the job's earlier sends and aborts. */
+  const onJob = (job, work) => {
+    const run = job.queue.then(work)
+    job.queue = run.catch(() => undefined)
+    return run
+  }
+
+  const send = (spec, text) => {
+    const job = jobFor(spec)
+    return onJob(job, async () => {
+      if (job.run && !job.run.finishing && !job.exited) {
+        const steered = await command(job, 'steer', { message: text })
+        if (!steered.success) throw new Error(steered.error ?? 'pi refused the steer')
+        return { action: 'steered', turnId: job.run.id, sessionFile: job.sessionFile }
+      }
+      if (!job.child || job.exited) await launch(job, spec)
+      const run = { id: `${job.id}-${++runCounter}`, lastAssistant: null, aborting: false, finishing: false, settleTimer: null }
+      job.run = run
+      const prompted = await command(job, 'prompt', { message: text })
+      if (!prompted.success) {
+        if (job.run === run) job.run = null
+        throw new Error(prompted.error ?? 'pi refused the prompt')
+      }
+      // An extension command handled it: no run starts.
+      if (prompted.data?.disposition === 'handled') void finishRun(job)
+      return { action: 'started', turnId: run.id, sessionFile: job.sessionFile }
+    })
+  }
+
+  const abort = jobId => {
+    const job = jobs.get(jobId)
+    if (!job) return Promise.resolve({ aborted: false })
+    return onJob(job, async () => {
+      if (!job.run || job.exited) return { aborted: false }
+      job.run.aborting = true
+      const answer = await command(job, 'abort', {}, 20_000)
+      // pi answers abort once idle; a run that sent no end event ends here.
+      if (job.run) void finishRun(job, { status: 'interrupted', error: answer.success ? null : answer.error })
+      return { aborted: true }
+    })
+  }
+
+  const stopJob = job => {
+    if (job.child && !job.exited) {
+      try {
+        job.child.stdin.end()
+      } catch {}
+      job.child.kill('SIGTERM')
+    }
+  }
+
+  const listModels = () =>
+    new Promise(resolve => {
+      if (models) return resolve({ result: { models } })
+      execFile(piPath, ['--list-models'], { env: childEnv, timeout: 30_000, maxBuffer: 8 << 20 }, (error, stdout, stderr) => {
+        const found = parseModelList(`${stdout}\n${stderr}`)
+        if (found.length === 0) {
+          return resolve({ error: { message: `pi --list-models listed no models${error ? `: ${error.message}` : ''}` } })
+        }
+        models = found
+        resolve({ result: { models } })
+      })
+    })
 
   const cleanup = () => {
     try {
@@ -212,12 +360,12 @@ async function daemon(codexPath, dir) {
   }
 
   const shutdown = code => {
-    if (codex.exitCode === null && codex.signalCode === null) codex.kill('SIGTERM')
+    for (const job of jobs.values()) stopJob(job)
     cleanup()
     // End the relay's stream before exiting, so the relay reads an ordinary end, not a reset.
     if (subscriber) subscriber.end()
     subscriber = null
-    setTimeout(() => process.exit(code), 100)
+    setTimeout(() => process.exit(code), 300)
   }
 
   const armGrace = () => {
@@ -225,24 +373,7 @@ async function daemon(codexPath, dir) {
     graceTimer = setTimeout(() => shutdown(0), GRACE_MS)
   }
 
-  codex.on('exit', (code, signal) => {
-    emit({ type: 'exit', code, signal, stderrTail })
-    for (const { resolve, timer } of pending.values()) {
-      clearTimeout(timer)
-      resolve({ error: { code: -32001, message: 'codex app-server exited' } })
-    }
-    if (subscriber) subscriber.end()
-    cleanup()
-    setTimeout(() => process.exit(code ?? 1), 100)
-  })
   for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => shutdown(0))
-
-  const init = await rpc('initialize', { clientInfo: { name: 'claude-code-codex-plugin', version: '0.1.0' } }, 30_000)
-  if (init.error) {
-    process.stderr.write(`initialize failed: ${JSON.stringify(init.error)}\n`)
-    return shutdown(1)
-  }
-  writeCodex({ method: 'initialized' })
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -256,14 +387,13 @@ async function daemon(codexPath, dir) {
         })
       }
       if (req.method === 'GET' && url.pathname === '/health') {
-        return sendJson(res, 200, { ok: true, pid: process.pid, codexPid: codex.pid, build: BUILD, active: Object.fromEntries(active) })
+        return sendJson(res, 200, { ok: true, pid: process.pid, build: BUILD, platform: process.platform, active: activeRuns() })
       }
       if (req.method === 'GET' && url.pathname === '/events') {
         if (subscriber) subscriber.end()
         clearTimeout(graceTimer)
         res.writeHead(200, { 'content-type': 'application/x-ndjson' })
-        res.write(JSON.stringify({ type: 'hello', reattached: everSubscribed, active: Object.fromEntries(active) }) + '\n')
-        for (const event of outstanding.values()) res.write(JSON.stringify(event) + '\n')
+        res.write(JSON.stringify({ type: 'hello', reattached: everSubscribed, active: activeRuns(), platform: process.platform }) + '\n')
         for (const event of buffer) res.write(JSON.stringify(event) + '\n')
         buffer = []
         subscriber = res
@@ -276,59 +406,45 @@ async function daemon(codexPath, dir) {
         })
         return
       }
+      if (req.method === 'GET' && url.pathname === '/models') return sendJson(res, 200, await listModels())
       if (req.method !== 'POST') return sendJson(res, 404, { error: { message: 'not found' } })
       const body = await readBody(req)
-      if (url.pathname === '/rpc') {
-        if (typeof body.method !== 'string') return sendJson(res, 400, { error: { message: 'method required' } })
-        const answer = await rpc(body.method, body.params, body.timeoutMs ?? 60_000)
-        if (body.method === 'turn/start' && answer.result?.turn?.id && body.params?.threadId) {
-          active.set(body.params.threadId, answer.result.turn.id)
+      if (url.pathname === '/send') {
+        const spec = body.job
+        if (!spec || typeof spec.id !== 'string' || typeof body.text !== 'string') {
+          return sendJson(res, 400, { error: { message: 'job and text are required' } })
         }
-        return sendJson(res, 200, answer)
+        try {
+          return sendJson(res, 200, { result: await send(spec, body.text) })
+        } catch (error) {
+          return sendJson(res, 200, { error: { message: String(error?.message ?? error) } })
+        }
       }
-      if (url.pathname === '/reply') {
-        if (!outstanding.has(body.id)) return sendJson(res, 404, { error: { message: `no open server request ${body.id}` } })
-        outstanding.delete(body.id)
-        writeCodex(body.error !== undefined ? { id: body.id, error: body.error } : { id: body.id, result: body.result })
+      if (url.pathname === '/abort') return sendJson(res, 200, { result: await abort(body.jobId) })
+      if (url.pathname === '/release') {
+        const job = jobs.get(body.jobId)
+        if (job && !job.run) {
+          stopJob(job)
+          jobs.delete(job.id)
+        }
         return sendJson(res, 200, { ok: true })
       }
       if (url.pathname === '/wait') {
-        const { threadId, msgKey, timeoutMs = 600_000 } = body
-        // Messages first: a job may send one and end its turn before the next poll.
-        if (msgKey && mailboxes.get(msgKey)?.length) return sendJson(res, 200, { status: 'message', messages: drainMail(msgKey) })
-        if (!active.has(threadId)) return sendJson(res, 200, { status: 'idle', turn: lastTurn.get(threadId) ?? null })
+        const { jobId, timeoutMs = 600_000 } = body
+        const job = jobs.get(jobId)
+        if (!job?.run) return sendJson(res, 200, { status: 'idle', turn: job?.lastTurn ?? null })
         const answer = await new Promise(resolve => {
-          const set = waiters.get(threadId) ?? new Set()
-          waiters.set(threadId, set)
-          const mail = msgKey ? (mailWaiters.get(msgKey) ?? new Set()) : null
-          if (mail) mailWaiters.set(msgKey, mail)
+          const set = waiters.get(jobId) ?? new Set()
+          waiters.set(jobId, set)
           const done = value => {
             clearTimeout(timer)
             set.delete(done)
-            mail?.delete(done)
-            resolve(value === MAIL ? { status: 'message', messages: drainMail(msgKey) } : value)
+            resolve(value)
           }
-          const timer = setTimeout(() => done({ status: 'timeout', turnId: active.get(threadId) ?? null }), timeoutMs)
+          const timer = setTimeout(() => done({ status: 'timeout', turnId: job.run?.id ?? null }), timeoutMs)
           set.add(done)
-          mail?.add(done)
         })
         return sendJson(res, 200, answer)
-      }
-      if (url.pathname === '/msg') {
-        const { key, text } = body
-        if (typeof key !== 'string' || key === '' || typeof text !== 'string' || text.trim() === '') {
-          return sendJson(res, 400, { error: { message: 'key and text are required' } })
-        }
-        const box = mailboxes.get(key) ?? []
-        if (box.length >= MAILBOX_CAP) return sendJson(res, 429, { error: { message: `${MAILBOX_CAP} messages are already waiting to be read` } })
-        box.push(text.slice(0, MESSAGE_CAP))
-        mailboxes.set(key, box)
-        const set = mailWaiters.get(key)
-        if (set) {
-          mailWaiters.delete(key)
-          for (const done of set) done(MAIL)
-        }
-        return sendJson(res, 200, { ok: true })
       }
       return sendJson(res, 404, { error: { message: 'not found' } })
     } catch (error) {
@@ -345,35 +461,9 @@ async function daemon(codexPath, dir) {
     armGrace()
   })
 
-  // Legacy daemon directory -> since when its daemon has been seen running no turn.
-  const legacyIdleSince = new Map()
-  const stopIdleLegacy = async () => {
-    const base = path.dirname(dir)
-    const now = Date.now()
-    for (const name of fs.readdirSync(base).filter(isLegacyDir)) {
-      const health = await readHealth(path.join(base, name, 's'))
-      if (!health || Object.keys(health.active ?? {}).length > 0) {
-        legacyIdleSince.delete(name)
-        continue
-      }
-      const since = legacyIdleSince.get(name) ?? now
-      legacyIdleSince.set(name, since)
-      if (now - since < LEGACY_IDLE_MS) continue
-      legacyIdleSince.delete(name)
-      // The pid the daemon reports must be the one its launcher recorded.
-      let recorded = null
-      try {
-        recorded = fs.readFileSync(path.join(base, name, 'pid'), 'utf8').trim()
-      } catch {}
-      if (recorded !== String(health.pid)) continue
-      process.stderr.write(`stopping idle daemon ${name} (pid ${health.pid}) of an older bridge build\n`)
-      process.kill(health.pid, 'SIGTERM')
-    }
-  }
   setInterval(() => {
-    if (active.size > 0 || inFlight > 0) lastUse = Date.now()
+    if (Object.keys(activeRuns()).length > 0 || inFlight > 0) lastUse = Date.now()
     else if (subscriber && Date.now() - lastUse >= IDLE_MS) shutdown(0)
-    stopIdleLegacy().catch(error => process.stderr.write(`legacy daemon sweep failed: ${error.message}\n`))
   }, IDLE_CHECK_MS)
 }
 
@@ -402,8 +492,9 @@ const readHealth = async socketPath => {
 
 const isHealthy = async socketPath => (await readHealth(socketPath)) !== null
 
+/** /tmp/pxb-<uid>: apart from the codex plugin's directory, so both run side by side. */
 const privateBase = () => {
-  const base = `/tmp/cxb-${process.getuid()}`
+  const base = `/tmp/pxb-${process.getuid()}`
   fs.mkdirSync(base, { recursive: true, mode: 0o700 })
   const stat = fs.lstatSync(base)
   if (!stat.isDirectory() || stat.uid !== process.getuid()) throw new Error(`${base} is not a directory this user owns`)
@@ -411,7 +502,7 @@ const privateBase = () => {
   return base
 }
 
-async function relay(codexPath, sessionKey) {
+async function relay(piPath, sessionKey) {
   const out = line => process.stdout.write(JSON.stringify(line) + '\n')
   process.stdout.on('error', () => process.exit(0))
   const parent = process.ppid
@@ -427,7 +518,7 @@ async function relay(codexPath, sessionKey) {
   if (!(await isHealthy(socketPath))) {
     fs.rmSync(dir, { recursive: true, force: true })
     fs.mkdirSync(dir, { mode: 0o700 })
-    const launcher = spawn(process.execPath, [SELF, '--launch', codexPath, dir], { detached: true, stdio: 'ignore' })
+    const launcher = spawn(process.execPath, [SELF, '--launch', piPath, dir], { detached: true, stdio: 'ignore' })
     await new Promise(resolve => launcher.on('exit', resolve))
     const daemonPid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'))
     const deadline = Date.now() + 30_000
@@ -453,24 +544,31 @@ async function relay(codexPath, sessionKey) {
   }
 
   const res = await request(socketPath, 'GET', '/events', 0)
-  res.setEncoding('utf8')
-  const lines = readline.createInterface({ input: res })
   let first = true
-  for await (const line of lines) {
-    if (first) {
-      first = false
-      const hello = JSON.parse(line)
-      out({ type: 'ready', socket: socketPath, reattached: hello.reattached, active: hello.active })
-      continue
+  let pending = ''
+  res.setEncoding('utf8')
+  for await (const chunk of res) {
+    pending += chunk
+    let at
+    while ((at = pending.indexOf('\n')) >= 0) {
+      const line = pending.slice(0, at)
+      pending = pending.slice(at + 1)
+      if (line.trim() === '') continue
+      if (first) {
+        first = false
+        const hello = JSON.parse(line)
+        out({ type: 'ready', socket: socketPath, reattached: hello.reattached, active: hello.active, platform: hello.platform })
+        continue
+      }
+      process.stdout.write(line + '\n')
     }
-    process.stdout.write(line + '\n')
   }
   process.exit(0)
 }
 
-function launch(codexPath, dir) {
+function launchDaemon(piPath, dir) {
   const log = fs.openSync(path.join(dir, 'daemon.log'), 'a', 0o600)
-  const daemonChild = spawn(process.execPath, [SELF, '--daemon', codexPath, dir], { detached: true, stdio: ['ignore', log, log] })
+  const daemonChild = spawn(process.execPath, [SELF, '--daemon', piPath, dir], { detached: true, stdio: ['ignore', log, log] })
   fs.writeFileSync(path.join(dir, 'pid'), String(daemonChild.pid), { mode: 0o600 })
   daemonChild.unref()
   process.exit(0)
@@ -478,14 +576,14 @@ function launch(codexPath, dir) {
 
 const [, , first, ...rest] = process.argv
 if (first === '--launch') {
-  const [codexPath, dir] = rest
-  launch(codexPath, dir)
+  const [piPath, dir] = rest
+  launchDaemon(piPath, dir)
 } else if (first === '--daemon') {
-  const [codexPath, dir] = rest
-  daemon(codexPath, dir)
+  const [piPath, dir] = rest
+  daemon(piPath, dir)
 } else if (first && rest[0]) {
   relay(first, rest[0])
 } else {
-  process.stderr.write('usage: bridge.mjs <codexPath> <sessionKey>\n')
+  process.stderr.write('usage: bridge.mjs <piPath> <sessionKey>\n')
   process.exit(2)
 }
