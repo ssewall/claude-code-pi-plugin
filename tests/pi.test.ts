@@ -329,6 +329,17 @@ test('sandbox argv: workspace-write allows the project, read-only does not, full
   expect(sandboxProfile('workspace-write')).toContain('(deny file-write*)')
   expect(sandboxProfile('workspace-write')).toContain('(subpath (param "PROJECT"))')
   expect(sandboxProfile('workspace-write')).toContain('"/.pi/agent/sessions"')
+  // pi's auth and settings stores: the files and their proper-lockfile lock dirs, as literals.
+  for (const name of ['auth.json', 'auth.json.lock', 'settings.json', 'settings.json.lock']) {
+    expect(sandboxProfile('workspace-write')).toContain(`(literal (string-append (param "HOME") "/.pi/agent/${name}"))`)
+  }
+  // Nothing else in ~/.pi: only the session dir is a subpath, and no extension or models paths.
+  const piRules = sandboxProfile('workspace-write').match(/\(\w+ \(string-append \(param "HOME"\) "[^"]*"\)\)/g)
+  expect(piRules).toHaveLength(5)
+  expect(piRules.filter(rule => rule.startsWith('(subpath'))).toEqual(['(subpath (string-append (param "HOME") "/.pi/agent/sessions"))'])
+  expect(sandboxProfile('workspace-write')).not.toMatch(/models|npm|extensions|"\/\.pi"|"\/\.pi\/agent"\)/)
+  // read-only is the same profile minus the project.
+  expect(sandboxProfile('read-only')).toBe(sandboxProfile('workspace-write').replace('(subpath (param "PROJECT")) ', ''))
   const ro = sandboxArgv({ project: '/private/tmp', home: '/Users/x', mode: 'read-only', cmd, platform: 'darwin' })
   expect(ro.join(' ')).not.toContain('PROJECT')
   expect(sandboxProfile('read-only')).not.toContain('PROJECT')

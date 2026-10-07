@@ -44,7 +44,7 @@ Run non-Claude models (via the `pi` CLI) as native background subagents in Claud
 - Fork, not new repo: user choice. Fork renamed to `claude-code-pi-plugin` so it's clearly a different plugin.
 - Keep the bridge daemon: the plugin API can't write to a child's stdin, the same reason upstream has it. Socket dir `/tmp/pxb-<uid>/`.
 - sandbox-exec, not a container: spike showed it confines pi and all child processes with 5 write paths and no startup breakage. It's deprecated by Apple but works on Darwin 27.
-- pi state write access narrowed to `~/.pi/agent/sessions` (not all of `~/.pi`) so the agent can't rewrite pi's auth/config/extensions. If a real run shows pi needs more, widen to the specific path and record why.
+- pi state write access narrowed to `~/.pi/agent/sessions` plus four literal paths: `~/.pi/agent/auth.json`, `auth.json.lock`, `settings.json`, `settings.json.lock` (not all of `~/.pi`). A live run showed pi 1.0.4 cannot even read credentials without them: its auth and settings stores take a proper-lockfile lock (mkdir `<file>.lock`) before reading, and rewrite the file in place (writeFileSync, no temp file or rename); OAuth refresh (xai) rewrites `auth.json`. Tradeoff: the agent can now overwrite `auth.json` and `settings.json`. Extensions dirs, `npm/`, `models.json` and `models-store.json` stay read-only.
 - Network open: user choice; model APIs need it anyway.
 - Grok model `xai/grok-4.7` (newest xai model in `pi --list-models`).
 - One pi process per job, kept alive until the job is dismissed or the bridge idles out (mirrors Codex thread lifetime).

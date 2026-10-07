@@ -48,10 +48,13 @@ pi runs under macOS `sandbox-exec` with this profile (see `bin/sandbox.mjs`):
 ```
 (version 1)(allow default)(deny file-write*)
 (allow file-write* (subpath PROJECT) (subpath "/private/tmp") (subpath "/private/var/folders")
-                   (subpath "~/.pi/agent/sessions") (subpath "/dev"))
+                   (subpath "~/.pi/agent/sessions")
+                   (literal "~/.pi/agent/auth.json") (literal "~/.pi/agent/auth.json.lock")
+                   (literal "~/.pi/agent/settings.json") (literal "~/.pi/agent/settings.json.lock")
+                   (subpath "/dev"))
 ```
 
-- `workspace-write` (default): pi and every process it starts can write only inside the project (its real path), `/private/tmp`, `/private/var/folders` (the per-user temp dirs), `/dev`, and pi's own session directory. A write anywhere else fails with "Operation not permitted".
+- `workspace-write` (default): pi and every process it starts can write only inside the project (its real path), `/private/tmp`, `/private/var/folders` (the per-user temp dirs), `/dev`, pi's own session directory, and pi's credential and settings files (below). A write anywhere else fails with "Operation not permitted".
 - `read-only`: the same profile without the project, and pi is started with only its read tools (`--tools read,grep,find,ls`).
 - `full-access`: no sandbox at all. Claude should use it only when you ask for it explicitly.
 
@@ -61,7 +64,7 @@ Know what it does not do:
 - **Network is open.** The model API needs it, and so does anything pi's tools fetch.
 - **No approvals.** Nothing asks you before a command runs. Inside the writable paths, pi can do anything.
 - `/tmp` is writable in every mode, so a project that lives under `/tmp` is writable even with `read-only` (there, only the read-only tool list stops pi from writing).
-- pi's own config (`~/.pi/agent/settings.json`, `auth.json`, extensions) is not writable. Inside the sandbox pi cannot take its settings lock, so it starts with default settings: extension packages listed in `settings.json` (extra providers, for example) do not load. Built-in providers such as xAI work.
+- pi's credential and settings files are writable: `~/.pi/agent/auth.json`, `~/.pi/agent/settings.json`, and their lock directories `auth.json.lock` and `settings.json.lock`. pi locks each file (by creating the `.lock` directory) before it reads it, so without these pi cannot read your API keys at all, and it rewrites `auth.json` when it refreshes an OAuth token (xAI login, for example). **Tradeoff:** a sandboxed job can overwrite `auth.json` and `settings.json`. Nothing else in `~/.pi` is writable: not extensions, `npm/`, or `models.json`.
 - Sandboxed modes need macOS. On other systems `workspace-write` and `read-only` refuse to start rather than run unconfined; only `full-access` runs.
 - `sandbox-exec` is deprecated by Apple but still works.
 

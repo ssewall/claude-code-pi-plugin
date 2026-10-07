@@ -257,6 +257,8 @@ async function daemon(piPath, dir) {
       onPiRecord(job, record)
     })
     jsonLines(child.stderr, line => {
+      // The daemon's stderr is daemon.log; keep pi's warnings there too.
+      process.stderr.write(`[pi ${job.id}] ${line}\n`)
       job.stderrTail.push(line)
       if (job.stderrTail.length > 40) job.stderrTail.shift()
     })
