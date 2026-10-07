@@ -1,106 +1,104 @@
-<p align="center">
-  <img src="./assets/readme/hero.svg" width="100%" alt="Codex for Claude Code. Illustration of a Claude Code session: one Codex agent is still running npm test, another has completed, and a one-line notice wakes Claude with its result.">
-</p>
+# pi for Claude Code
 
-A Claude Code plugin that runs OpenAI Codex (luna, sol, astra, terra) as native Claude Code background subagents. Claude hands a task to a `codex:sol` agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` and `TaskStop` reach it, and when Codex finishes, the native `Agent "<description>" finished` notification brings Claude the Codex final message, word for word. Codex approval requests show up as Claude Code dialogs.
+A Claude Code plugin that runs the [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) as native Claude Code background subagents. Claude hands a task to a `pi:grok` (or `pi:run`) agent through its own Agent tool and carries on. The job shows in the native task list, `SendMessage` steers it, `TaskStop` aborts it, and when it finishes Claude gets the normal subagent notification with pi's final message as the result.
 
-<p align="center">
-  <img src="./assets/readme/demo.gif" width="100%" alt="Demo: Claude starts a codex:sol agent that writes calc.js with two hidden bugs, then runs a reviewer and a test writer in parallel. The test writer asks Claude a question mid-task, Claude answers, both agents report back through native finish notifications, and Claude summarizes the two bugs they found.">
-</p>
+This is a fork of [SSS135/claude-code-codex-plugin](https://github.com/SSS135/claude-code-codex-plugin), which does the same for OpenAI Codex. The wrapper-agent design, job store and transcript rows come from it; the backend is replaced with pi. It installs as a separate plugin named `pi`, so it runs side by side with the codex plugin.
 
 ## How it works
 
-<p align="center">
-  <img src="./assets/readme/flow.svg" width="100%" alt="Four steps: Claude starts a codex:luna background agent and moves on; Codex works in its own sandbox while the native task list shows progress; escalations go to a Claude Code dialog in ask mode or to Codex's reviewer in auto mode; the result arrives as a native task notification and SendMessage continues the thread.">
-</p>
-
-The plugin registers four agent types, one per Codex model: `codex:luna`, `codex:sol`, `codex:astra` and `codex:terra`. Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a Codex agent fix the flaky retry test". Claude turns that into an Agent call like this:
-
-```json
-{ "subagent_type": "codex:sol", "description": "Fix flaky retry test", "prompt": "effort: medium\nFix the flaky test in retry.test.ts and run it." }
-```
-
-### Which agent Claude picks
-
-Each agent type's description in Claude's agent listing opens with when to use it, so Claude routes by it:
+The plugin registers two agent types:
 
 | Agent type | Model | Default effort | Use it for |
 | --- | --- | --- | --- |
-| `codex:sol` | `gpt-6.1-sol` | high | Normal tasks: implementation, debugging, analysis, review, anything needing judgement. The default. |
-| `codex:luna` | `gpt-6-luna` | max | Simple mechanical work and searches: find/grep/list, bulk renames, boilerplate, straightforward well-specified edits, data gathering. Cheap and fast. |
-| `codex:astra` | `gpt-6-astra` | high | Only when you ask for astra explicitly. |
-| `codex:terra` | `gpt-5.6-terra` | high | Only when you ask for terra explicitly. |
+| `pi:grok` | `xai/grok-4.7` | high | Grok, through pi. |
+| `pi:run` | whatever the prompt's `model:` line names | high | Any model `pi --list-models` shows. The `model:` line is required (or a project default, see below). |
+
+Claude uses them like `general-purpose`, so you can ask in plain words, for example "have a pi grok agent review retry.ts". A call looks like:
+
+```json
+{ "subagent_type": "pi:run", "description": "Review retry logic", "prompt": "model: xai/grok-4.3\neffort: medium\nReview retry.ts for bugs." }
+```
 
 What happens then:
 
-- The plugin starts the Codex thread and turn itself, with the Agent call's prompt exactly as given (header lines taken off), in the Agent call's `cwd` or the session's. Nothing is relayed through a Claude model.
-- The agent the engine starts for it is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while Codex works, the wrapper calls the plugin's `codex_await` tool, and once the Codex turn ends, it hands back the Codex final message, verbatim. Where the engine requires a background subagent to report through `SubagentHandback` (auto mode), that call carries it; where the engine does not offer that tool, the failed call is followed by the message as the final text. No Claude model runs for it, so it costs no Claude tokens.
-- The wrapper is a real background subagent: it is in the task list ("↓ to manage"), and its finish row and the notification Claude reads are the engine's own.
-- `SendMessage` to the agent (by its agentId, or the `name` the Agent call gave) goes to Codex first: it steers the running turn, or, once the agent finished, starts a new turn on the same Codex thread and resumes the agent, which then notifies again. If Codex refuses the message, `SendMessage` reports it as not delivered.
-- Codex can message the session mid-task (see Messages from Codex below), and a `SendMessage` reply reaches its running turn.
-- `TaskStop`, or stopping the task from the task list, interrupts the Codex turn.
+- The plugin checks the header, the model (against `pi --list-models`) and the sandbox before the subagent starts, so a bad one refuses the Agent call itself.
+- It starts one `pi --mode rpc` process for the job, in the Agent call's `cwd` or the session's, and sends the prompt exactly as given (header lines taken off). Nothing is relayed through a Claude model.
+- The agent the engine starts is a thin wrapper. Every model request of its loop is answered by the plugin (a `turn.step` hook): while pi works, the wrapper calls the plugin's `pi_await` tool; once pi's turn ends, it hands back pi's final message, word for word.
+- `SendMessage` to the agent (by agentId, or the `name` the Agent call gave) goes to pi first: a `steer` while the turn runs, or a new `prompt` in the same pi session once it finished. pi keeps the conversation, so a follow-up can refer to the earlier turn. If the pi process is gone (the bridge restarted), the plugin relaunches pi with `--session <file>` on the same session file.
+- `TaskStop`, or stopping the task from the task list, sends pi `abort`; the job then shows as `interrupted` in `pi_list`.
 
 ### Prompt header lines
 
-Optional lines at the very top of the prompt, one `key: value` each, set how Codex runs. They are taken off before Codex sees the prompt; everything after them is passed as given.
+Optional lines at the very top of the prompt, one `key: value` each. They are taken off before pi sees the prompt.
 
 | Line | Values | Default |
 | --- | --- | --- |
-| `effort:` | low, medium, high, xhigh, max, ultra (luna does not take ultra) | the model's own (luna max, the others high), unless `defaultEffort` or the project sets one |
+| `model:` | `provider/id`, as `pi --list-models` names it. `pi:run` only. | the project's `model`; otherwise required |
+| `effort:` | off, minimal, low, medium, high, xhigh, max (`ultra` is accepted and means max) | high, unless `defaultEffort` or the project sets one |
 | `sandbox:` | read-only, workspace-write, full-access | `defaultSandbox` |
-| `approvals:` | auto, ask, never, yolo | `defaultApprovals` |
 
-An effort the model does not take, an unknown sandbox or approvals value, a key given twice, or a prompt with nothing after its header refuses the Agent call before any agent starts. `approvals: yolo` means no sandbox and no approvals; Claude is told to use it only when you asked for it explicitly in the request.
+An unknown value, a key given twice, `model:` on `pi:grok`, a model pi does not list, or a prompt with nothing after its header refuses the Agent call. pi passes the effort to the model as its thinking level (`--thinking`); what a model that lacks that level gets is pi's choice.
 
-### Messages from Codex
+There is no `approvals:` line. pi has no approval hooks, so nothing is ever asked: the sandbox alone limits what a job can write. An `approvals:` line is refused with an error rather than ignored.
 
-A Codex job can message the Claude session mid-task, as a native background subagent can `SendMessage` to `main`: a question it needs answered, a blocker, or an important interim finding. Each Codex thread gets one extra MCP server, `claude_session` (`bin/codex-msg`, Node, no dependencies), with one tool, `message_claude(text)`, and developer instructions saying when to use it. The tool posts the text to the bridge daemon (`POST /msg`), which holds it for the job's agent; the agent's `codex_await` returns early, and the plugin has the agent send the text to `main` with its own `SendMessage` call, word for word, then wait again. In auto mode the plugin allows that call itself through a `tool.check` hook, only for the call it made: no model request produced the step, so auto mode's classifier has no verdict for it. Claude sees the native message row from that agent. A reply is an ordinary `SendMessage` to the agent, which steers the running Codex turn, so Codex reads it mid-turn as a new user message.
+## Sandbox
 
-It is an MCP server, not a shell command, because Codex's sandboxes refuse a shell command's `connect()` to the bridge's Unix socket: both `read-only` and `workspace-write` fail with EPERM (tested with `codex sandbox`, Codex CLI 0.160), and only `network_access = true` lifts that, which opens the network too. Codex starts its MCP servers outside the job's sandbox, so `message_claude` works in every sandbox, and in testing it ran without an approval prompt under `approvals: ask`.
+pi runs under macOS `sandbox-exec` with this profile (see `bin/sandbox.mjs`):
 
-Each job is named after the Agent call's description, numbered when another job has it (`Fix flaky retry test`, `Fix flaky retry test (2)`); the Codex thread carries the description too, so the session is easy to find in the Codex app, `codex resume` and `codex agents`.
+```
+(version 1)(allow default)(deny file-write*)
+(allow file-write* (subpath PROJECT) (subpath "/private/tmp") (subpath "/private/var/folders")
+                   (subpath "~/.pi/agent/sessions") (subpath "/dev"))
+```
+
+- `workspace-write` (default): pi and every process it starts can write only inside the project (its real path), `/private/tmp`, `/private/var/folders` (the per-user temp dirs), `/dev`, and pi's own session directory. A write anywhere else fails with "Operation not permitted".
+- `read-only`: the same profile without the project, and pi is started with only its read tools (`--tools read,grep,find,ls`).
+- `full-access`: no sandbox at all. Claude should use it only when you ask for it explicitly.
+
+Know what it does not do:
+
+- **Reads are open.** pi can read any file your user can, including `~/.ssh`, `~/.aws` and `.env` files. This matches Codex's `workspace-write`.
+- **Network is open.** The model API needs it, and so does anything pi's tools fetch.
+- **No approvals.** Nothing asks you before a command runs. Inside the writable paths, pi can do anything.
+- `/tmp` is writable in every mode, so a project that lives under `/tmp` is writable even with `read-only` (there, only the read-only tool list stops pi from writing).
+- pi's own config (`~/.pi/agent/settings.json`, `auth.json`, extensions) is not writable. Inside the sandbox pi cannot take its settings lock, so it starts with default settings: extension packages listed in `settings.json` (extra providers, for example) do not load. Built-in providers such as xAI work.
+- Sandboxed modes need macOS. On other systems `workspace-write` and `read-only` refuse to start rather than run unconfined; only `full-access` runs.
+- `sandbox-exec` is deprecated by Apple but still works.
 
 ## Install
 
-At a Claude Code prompt:
+From a clone:
 
 ```
-/plugin marketplace add SSS135/claude-code-codex-plugin
-/plugin install codex@codex-plugin
+claude --plugin-dir /path/to/claude-code-pi-plugin
 ```
 
-Or in one line, answering `y` to add the marketplace and then choosing a scope:
+Or add the repo as a marketplace:
 
 ```
-/plugin install codex --marketplace SSS135/claude-code-codex-plugin
-```
-
-From a shell:
-
-```
-claude plugin marketplace add SSS135/claude-code-codex-plugin
-claude plugin install codex@codex-plugin
+claude plugin marketplace add ssewall/claude-code-pi-plugin
+claude plugin install pi@pi-plugin
 ```
 
 ### Requirements
 
 - Claude Code with the hooks plugin API (function hooks, currently early access).
-- The Codex CLI with `codex app-server`. It ships inside the ChatGPT desktop app on macOS, or you can install it separately.
+- pi 1.0 or newer (`pi --mode rpc`), with credentials for the providers you use (`pi auth`).
 - Node 18 or newer.
-- macOS or Linux, because the bridge talks over a Unix socket.
+- macOS for the sandboxed modes.
 
 ## Tools
 
-Besides the agent types, Claude sees two tools as `mcp__codex__<name>`:
+Besides the agent types, Claude sees two tools as `mcp__pi__<name>`:
 
 | Tool | Parameters | What it does |
 | --- | --- | --- |
-| `codex_list` | none | Lists this session's Codex jobs, newest first and at most the latest 10, with model, status, tokens and current activity. |
-| `codex_result` | `id`, `full` | Status and final message. With `full=true` it adds the turn digest: commands with exit codes, file changes and messages. |
+| `pi_list` | none | This session's pi jobs, newest first, at most 10, with model, effort, sandbox, status, tokens and current activity. |
+| `pi_result` | `id`, `full` | Status and final message. With `full=true` it adds the turn digest: tool calls with their outcome, notes and steers. |
 
-`id` is the agent's agentId or the job's name (its description, as `codex_list` shows it); `codex_result` reads any job the plugin still holds, including older ones and other sessions'. A third tool, `codex_await`, serves the wrapper agents alone and refuses any other caller.
+`id` is the agent's agentId or the job's name (its description). A third tool, `pi_await`, serves the wrapper agents only.
 
-In the transcript each call is one row like a native one, for example `● Codex(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`codex: Fix flaky retry test (luna)`); the native task list (↓ to manage) shows and stops them.
+In the transcript each call is one row, for example `● Pi(list)` over `⎿  2 agents · 1 running`. While jobs run they are also named at the end of the hint line under the prompt (`pi: Review retry logic (grok-4.7)`).
 
 ## Configuration
 
@@ -108,60 +106,49 @@ Set these in the install screen or the plugin's config menu (`userConfig`):
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `codexPath` | `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex` | The Codex CLI. If the path does not exist, `codex` is looked up on PATH. |
-| `nodePath` | `/opt/homebrew/bin/node` | Node used to run the bridge. If the path does not exist, `node` is looked up on PATH. |
-| `defaultEffort` | `per-model` | `per-model` uses each model's own default: max for luna, high for sol, astra and terra. Any other value (low, medium, high, xhigh, max, ultra) applies to every model; luna does not take ultra. |
+| `piPath` | `/opt/homebrew/bin/pi` | The pi CLI. If the path does not exist, `pi` is looked up on PATH. |
+| `nodePath` | `/opt/homebrew/bin/node` | Node used to run the bridge (and pi, which is a Node script). If the path does not exist, `node` is looked up on PATH. |
+| `defaultEffort` | `per-model` | `per-model` uses each agent's own default (high). Any other level applies to every agent. |
 | `defaultSandbox` | `workspace-write` | read-only, workspace-write, full-access. |
-| `defaultApprovals` | `auto` | auto, ask, never. |
 
-Both path defaults are macOS paths (Apple Silicon with Homebrew). Elsewhere, either keep them and put `codex` and `node` on PATH, or set absolute paths.
-
-A project can set its own defaults in `.claude/codex.json`. The plugin uses the nearest one found walking up to the project root:
+A project can set its own defaults in `.claude/pi.json`. The plugin uses the nearest one found walking up to the project root:
 
 ```json
-{ "effort": "medium", "sandbox": "workspace-write", "approvals": "ask" }
+{ "effort": "medium", "sandbox": "workspace-write", "model": "xai/grok-4.3" }
 ```
 
-When a setting comes from several places, the prompt's header lines beat the project's `.claude/codex.json`, which beats `userConfig`, which beats the built-in defaults. For effort, the built-in default is per model (luna max, the others high); an `effort` in `.claude/codex.json`, or a `defaultEffort` other than `per-model`, replaces it for every model. The model comes from the agent type: `codex:luna` is `gpt-6-luna` (fast, cheap), `codex:sol` is `gpt-6.1-sol` (strongest, the default for normal work), `codex:astra` is `gpt-6-astra`, and `codex:terra` is `gpt-5.6-terra`.
-
-## Approval modes
-
-- `ask`: you approve each escalation in a Claude Code dialog. The choices are Allow once, Allow for session and Deny, plus Allow always where Codex can save a rule.
-- `auto`: Codex's own reviewer decides on escalations. It is looser than Claude Code's auto mode; in testing it approved writes outside the workspace.
-- `never`: no escalation. The sandbox alone decides.
-- `yolo`: full bypass with no sandbox and no approvals. Claude uses it only when you ask for it explicitly in the request, or when a project's `.claude/codex.json` makes it the default. You cannot set it as a user-wide default.
-
-"Allow always" adds a `prefix_rule` to Codex's own rules file, `~/.codex/rules/default.rules`, managed like any Codex rule. That rule then applies to every Codex session on the machine, including ones started outside this plugin.
+`model` is the model `pi:run` uses when its prompt has no `model:` line; `pi:grok` always runs Grok. The prompt's header lines beat `.claude/pi.json`, which beats `userConfig`, which beats the built-in defaults.
 
 ## Architecture
 
-<p align="center">
-  <img src="./assets/readme/architecture.svg" width="100%" alt="The hooks module in Claude Code sends requests over HTTP on a Unix socket to a detached daemon, which runs codex app-server over stdio. The relay, bin/bridge.mjs, reads the daemon's event stream and passes it back to the hooks module as NDJSON on stdout.">
-</p>
+The hooks module (`hooks/register.tsx`, with the pure logic in `hooks/model.ts`) starts `bin/bridge.mjs` as a relay. The relay launches a detached daemon, or reattaches to one still running, in `/tmp/pxb-<uid>/<session>-<build>/` (the codex plugin uses `/tmp/cxb-<uid>/`, so the two never meet). The daemon serves HTTP on a Unix socket there and owns one `pi --mode rpc` child per job, wrapped by `sandbox-exec`. It talks JSONL to each child on stdin and stdout and relays the events the plugin needs as NDJSON.
 
-The hooks module starts `bin/bridge.mjs` as a relay (and Codex starts `bin/codex-msg` per thread, which posts to the same socket). The relay launches a detached daemon, or reattaches to one that is still running. The daemon owns `codex app-server` and serves an HTTP API on a Unix socket under `/tmp/cxb-<uid>/` (mode 0700, owned by your user). The module sends requests over that socket, and the relay streams the daemon's events back to it as NDJSON on stdout.
+| Plugin action | pi RPC |
+| --- | --- |
+| Agent call | `prompt` |
+| SendMessage while running | `steer` |
+| SendMessage after the turn | `prompt` on the live process, or a relaunch with `--session <file>` first |
+| TaskStop | `abort` |
+| Final message | the last assistant message of `agent_end`, else `get_last_assistant_text` |
 
-The bridge exists because the plugin API cannot write to a child process's stdin once it has spawned it, and `codex app-server` speaks JSON-RPC over stdio. The daemon runs detached so that Codex turns keep running through a plugin reload. After a reload the module reattaches, and the job list is restored from the plugin store.
+A turn ends at `agent_settled` (or 3 seconds after a final `agent_end` if that never comes). Dialogs that pi extensions open are cancelled, since there is no one to answer them.
+
+The bridge exists because the plugin API cannot write to a child's stdin once it has spawned it. The daemon runs detached so that pi turns keep running through a plugin reload.
 
 Processes end with the work they serve:
 
-- When a job's turn ends, the plugin unsubscribes from its thread (`thread/unsubscribe`). About a minute later `codex app-server` unloads the thread and stops the MCP servers it started for it: `codex-msg`, and those of Codex's own plugins, such as `computer-history`. A `SendMessage` to the job resumes the thread (`thread/resume`) before its next turn.
-- The daemon exits 20 seconds after its relay goes away (the Claude session ended), or after 10 minutes with no turn running and no request. Codex and every MCP server it started exit with it. The plugin starts a new daemon when it next needs one.
-- The daemon's directory names the bridge build (its path and code), so a session reloaded onto another plugin version starts a new daemon, and the old one exits once its relay is gone. A daemon started by plugin 0.2.2 or earlier, which never exits on its own while its session lives, is stopped by a newer daemon that has seen it run no turn for 5 minutes.
+- Each pi process stays alive between turns (so a follow-up continues the same process) until the daemon exits.
+- The daemon exits 20 seconds after its relay goes away (the Claude session ended), or after 10 minutes with no turn running and no request. Every pi process exits with it. The plugin starts a new daemon on demand, and a job's next message relaunches pi on its session file.
+- The daemon's directory names the bridge build (its path and code), so a session reloaded onto another plugin version starts a new daemon, and the old one exits once its relay is gone.
 
 ## Known limits
 
-- The wrapper agent is defined on `haiku`, because an agent type must name a Claude model; the plugin answers every request of its loop, so that model is never called. Where the engine names the agent's model (its task details), it may say haiku; `codex_list` and `codex_result` show the Codex model.
-- If the plugin's `turn.step` hook fails for a wrapper request, the engine sends that request to haiku, whose system prompt tells it to call `codex_await` and deliver its result unchanged. A failure is reported in the transcript's dim plugin line.
-- In auto mode the hand-back arrives with the engine's note that auto mode's classifier was unavailable for the agent's work: the classifier judges a model's actions with its request, and the wrapper's steps make no request. Only that classifier may allow `SubagentHandback`, so the plugin cannot allow it itself. The report under the note is the Codex final message, verbatim.
-- The final message and each `message_claude` message are passed on whole up to 20,000 characters; a longer one is cut there. At most 50 messages wait unread per job.
-- Messages are read only while the job's agent runs; one still unread when the bridge daemon exits is lost.
-- A Codex thread is started before the Agent call's subagent; if another plugin then refuses the spawn, that thread stays unused.
-- The model is chosen by the agent type alone: the four aliases, no other Codex model id.
-- Each Agent call starts a new Codex thread. `SendMessage` continues one; there is no way to attach a new agent to an older thread.
-- The plugin API does not tell a tool row whether ctrl+o is expanding it, so the text a `codex_*` call returned is not drawn under its row; `codex_result` shows a job's result.
+- The wrapper agent is defined on `haiku`, because an agent type must name a Claude model; the plugin answers every request of its loop, so that model is never called.
+- pi cannot message Claude mid-task (the codex plugin's `message_claude` is not ported).
+- A steer is delivered after pi's current tool calls finish, before its next model call.
+- The final message is passed on whole up to 20,000 characters.
+- `tokens` in `pi_list` is the sum of each model call's reported total, so it counts the context once per call.
 - The running-jobs line under the prompt is drawn on the terminal only.
-- Resuming a thread right after Claude Code restarts can take about 20 seconds while Codex reloads it.
 - The hooks plugin API is early access and may change between Claude Code releases.
 
 ## Development
@@ -169,9 +156,10 @@ Processes end with the work they serve:
 ```
 claude plugin validate .
 claude plugin test .
+docs/verify.sh
 claude --plugin-dir .
 ```
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Original work copyright (c) 2026 SSS135; forked from [SSS135/claude-code-codex-plugin](https://github.com/SSS135/claude-code-codex-plugin).
